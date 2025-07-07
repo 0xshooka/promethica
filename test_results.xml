@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="6" failures="1" time="15.24">
+  <testsuite name="PromeithicaE2ETests">
+    <testcase name="APP遺伝子基本検索" time="1.99">
+    </testcase>
+    <testcase name="タンパク質詳細情報取得" time="1.92">
+    </testcase>
+    <testcase name="遺伝子からタンパク質へのカスケード" time="4.15">
+    </testcase>
+    <testcase name="包括的分析" time="4.99">
+      <failure message="Test failed">
+        実際の応答が取得できませんでした
+      </failure>
+    </testcase>
+    <testcase name="PDB構造検索" time="0.40">
+    </testcase>
+    <testcase name="パスウェイ検索" time="1.80">
+    </testcase>
+  </testsuite>
+</testsuites>
