@@ -31,8 +31,8 @@ mcp = FastMCP("promethica")
 
 APIs = {
     "uniprot": "https://rest.uniprot.org",
-    "reactome": "https://reactome.org/ContentService",
-    "reactome_analysis": "https://reactome.org/AnalysisService",
+    "reactome": "https://reactome.org/ContentService/data",
+    "reactome_analysis": "https://reactome.org/AnalysisService/data",
     "pdb": "https://data.rcsb.org/rest/v1",
     "pdb_search": "https://search.rcsb.org/rcsbsearch/v2/query",
     "go": "https://api.geneontology.org/api",
@@ -267,21 +267,33 @@ async def search_pdb_structures(query: str, size: int = 25) -> str:
         return _err("サイズは1-100の範囲で指定してください")
 
     search_query = {
-        "query": {"type": "terminal", "service": "text", "parameters": {"value": query}},
+        "query": {
+            "type": "terminal",
+            "service": "full_text",
+            "parameters": {"value": query},
+        },
         "return_type": "entry",
         "request_options": {
-            "return_all_hits": True,
+            "paginate": {"start": 0, "rows": size},
             "results_verbosity": "minimal",
             "sort": [{"sort_by": "score", "direction": "desc"}],
         },
     }
 
     result = await make_api_request(APIs["pdb_search"], json_data=search_query)
+
+    # 204 No Content = 検索結果0件（正常）
+    if isinstance(result, dict) and result.get("_status") == 204:
+        return _ok({
+            "query_id": None,
+            "result_type": "entry",
+            "total_count": 0,
+            "result_set": [],
+            "message": f"'{query}' に一致する構造は見つかりませんでした"
+        })
+
     if _is_error(result):
         return _err("PDB検索に失敗しました", **result)
-
-    if "result_set" in result:
-        result["result_set"] = result["result_set"][:size]
     return _ok(result)
 
 
@@ -317,31 +329,32 @@ async def search_pathways(query: str, species: str = "Homo sapiens") -> str:
     if not query or not query.strip():
         return _err("検索クエリが必要です")
 
-    q = quote(query.strip(), safe="")
-    errors: list[dict] = []
+    q = query.strip()
 
-    # 1. query/entities エンドポイントを順に試行
-    for path in (f"/data/query/{q}", f"/data/entities/{q}"):
-        result = await make_api_request(f"{APIs['reactome']}{path}", {"species": species})
-        if not _is_error(result):
-            return _ok(result)
-        errors.append({"endpoint": path, **result})
-
-    # 2. 検索クエリAPI
+    # 1. Reactome Search API（SolR検索）
+    #    エンドポイント: /ContentService/search/query （/data/ 配下ではない）
+    search_url = APIs["reactome"].replace("/data", "") + "/search/query"
     result = await make_api_request(
-        f"{APIs['reactome']}/data/search/query",
-        {"q": query.strip(), "species": species, "types": "Pathway"},
+        search_url,
+        {"query": q, "species": species, "cluster": "true"},
     )
     if not _is_error(result):
         return _ok(result)
-    errors.append({"endpoint": "/data/search/query", **result})
+
+    # 2. フォールバック: Reactome stable ID or dbId として直接クエリ
+    q_enc = quote(q, safe="")
+    result2 = await make_api_request(
+        f"{APIs['reactome']}/query/{q_enc}",
+        {"species": species},
+    )
+    if not _is_error(result2):
+        return _ok(result2)
 
     return _err(
         "Reactomeパスウェイの取得に失敗しました",
-        query=query,
+        query=q,
         species=species,
-        attempts=errors,
-        suggestion=f"https://reactome.org/content/query?q={q}",
+        suggestion=f"https://reactome.org/content/query?q={q_enc}",
     )
 
 
@@ -355,8 +368,28 @@ async def get_protein_pathways(accession: str) -> str:
     if not accession or not accession.strip():
         return _err("アクセッション番号が必要です")
     acc = accession.strip()
+    acc_enc = quote(acc, safe="")
 
-    # 1. Reactome AnalysisService
+    # ===== 1. Mapping API（軽量・高速、新規追加） =====
+    mapping_url = f"{APIs['reactome']}/mapping/UniProt/{acc_enc}/pathways"
+    mapping = await make_api_request(mapping_url)
+    if not _is_error(mapping) and isinstance(mapping, list) and len(mapping) > 0:
+        return _ok({
+            "accession": acc,
+            "pathways": [
+                {
+                    "stId": p.get("stId"),
+                    "name": p.get("displayName"),
+                    "species": p.get("speciesName"),
+                    "url": f"https://reactome.org/PathwayBrowser/#/{p.get('stId')}",
+                }
+                for p in mapping
+            ],
+            "total_count": len(mapping),
+            "method": "Reactome Mapping API",
+        })
+
+    # ===== 2. AnalysisService フォールバック（既存のまま） =====
     analysis = await make_api_request(
         f"{APIs['reactome_analysis']}/identifiers",
         params={
@@ -401,8 +434,7 @@ async def get_protein_pathways(accession: str) -> str:
 
     logger.info("Reactome AnalysisService failed, falling back to UniProt for %s", acc)
 
-    # 2. UniProtフォールバック
-    acc_enc = quote(acc, safe="")
+    # ===== 3. UniProtフォールバック（既存のまま） =====
     uni = await make_api_request(f"{APIs['uniprot']}/uniprotkb/{acc_enc}", {"format": "json"})
     if _is_error(uni):
         return _err(
@@ -415,10 +447,13 @@ async def get_protein_pathways(accession: str) -> str:
 
     info: dict[str, Any] = {
         "accession": acc,
-        "source": "UniProt (Reactome AnalysisService fallback)",
+        "source": "UniProt (Reactome fallback)",
         "pathways": [],
         "cross_references": [],
-        "protein_name": uni.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "Unknown"),
+        "protein_name": uni.get("proteinDescription", {})
+            .get("recommendedName", {})
+            .get("fullName", {})
+            .get("value", "Unknown"),
     }
     for ref in uni.get("uniProtKBCrossReferences", []):
         if ref.get("database") == "Reactome":
