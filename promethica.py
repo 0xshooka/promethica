@@ -10,651 +10,650 @@ Promethica MCP Server
 - Gene Ontology API (機能分類)
 """
 
+import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional
+import random
+from typing import Any, Optional
 from urllib.parse import quote
 
 import httpx
+from cachetools import TTLCache
 from mcp.server.fastmcp import FastMCP
 
-# ロギング設定
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("promethica")
 
-# FastMCPサーバーを初期化
 mcp = FastMCP("promethica")
 
-# API エンドポイント
 APIs = {
     "uniprot": "https://rest.uniprot.org",
     "reactome": "https://reactome.org/ContentService",
-    "reactome_analysis": "https://reactome.org/AnalysisService",  # 公式分析API
+    "reactome_analysis": "https://reactome.org/AnalysisService",
     "pdb": "https://data.rcsb.org/rest/v1",
     "pdb_search": "https://search.rcsb.org/rcsbsearch/v2/query",
-    "go": "http://api.geneontology.org/api"
+    "go": "https://api.geneontology.org/api",
 }
 
-# HTTPクライアント設定
 CLIENT_HEADERS = {
-    "User-Agent": "Promethica-MCP-Server/1.0.0 (Drug Discovery Research Tool)"
+    "User-Agent": "Promethica-MCP-Server/1.0.0 (Drug Discovery Research Tool)",
+    "Accept": "application/json",
 }
 
-async def make_api_request(url: str, params: Optional[Dict] = None, json_data: Optional[Dict] = None) -> Dict[str, Any] | None:
-    """汎用APIリクエスト関数"""
-    async with httpx.AsyncClient(headers=CLIENT_HEADERS, timeout=30.0) as client:
+DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+MAX_RETRIES = 3
+
+# Module-level client with connection pooling. Lazily created to avoid loop issues.
+_client: Optional[httpx.AsyncClient] = None
+_client_lock = asyncio.Lock()
+
+# Simple TTL cache for idempotent GET responses (keyed by method+url+params).
+_response_cache: TTLCache = TTLCache(maxsize=256, ttl=600)
+
+
+async def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        async with _client_lock:
+            if _client is None:
+                _client = httpx.AsyncClient(
+                    headers=CLIENT_HEADERS,
+                    timeout=DEFAULT_TIMEOUT,
+                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                    follow_redirects=True,
+                )
+    return _client
+
+
+def _escape_lucene(value: str) -> str:
+    """UniProtのLuceneクエリ用に " と \\ をエスケープ."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _err(message: str, **extra: Any) -> str:
+    payload = {"error": message}
+    payload.update(extra)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _ok(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+async def make_api_request(
+    url: str,
+    params: Optional[dict] = None,
+    json_data: Optional[dict] = None,
+    content: Optional[str] = None,
+    extra_headers: Optional[dict] = None,
+    use_cache: bool = True,
+) -> dict[str, Any]:
+    """汎用APIリクエスト関数。
+
+    戻り値は常にdict: 成功時はJSON/テキストデコード済みデータ、失敗時は {"_error": ..., "_status": ...}。
+    - 429/503 はRetry-Afterを尊重して指数バックオフで最大MAX_RETRIES回リトライ
+    - ネットワーク/タイムアウトもリトライ
+    - GET結果は短時間TTLキャッシュ
+    """
+    method = "POST" if (json_data is not None or content is not None) else "GET"
+    cache_key = None
+    if method == "GET" and use_cache:
+        cache_key = (url, tuple(sorted((params or {}).items())))
+        if cache_key in _response_cache:
+            return _response_cache[cache_key]
+
+    client = await _get_client()
+    last_err: dict[str, Any] = {"_error": "unknown", "_status": None}
+
+    for attempt in range(MAX_RETRIES):
         try:
-            if json_data:
-                response = await client.post(url, json=json_data)
+            if method == "POST":
+                if json_data is not None:
+                    response = await client.post(url, params=params, json=json_data, headers=extra_headers)
+                else:
+                    response = await client.post(url, params=params, content=content, headers=extra_headers)
             else:
-                response = await client.get(url, params=params)
-            
-            response.raise_for_status()
-            
-            # レスポンスの内容タイプを確認
-            content_type = response.headers.get('content-type', '')
-            if 'application/json' in content_type:
-                return response.json()
-            else:
-                return {"text": response.text, "content_type": content_type}
-                
-        except Exception as e:
-            logger.error(f"API request failed for {url}: {e}")
-            return None
+                response = await client.get(url, params=params, headers=extra_headers)
+
+            if response.status_code in (429, 503):
+                retry_after = response.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt + random.random()
+                logger.warning("rate-limited %s (status=%s, attempt=%s, sleep=%.1fs)", url, response.status_code, attempt + 1, delay)
+                last_err = {"_error": f"HTTP {response.status_code}", "_status": response.status_code}
+                await asyncio.sleep(delay)
+                continue
+
+            if response.status_code >= 400:
+                logger.warning("http error %s %s: %s", response.status_code, url, response.text[:200])
+                return {"_error": f"HTTP {response.status_code}", "_status": response.status_code, "_body": response.text[:500]}
+
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                try:
+                    return response.json()
+                except json.JSONDecodeError as e:
+                    return {"_error": f"invalid JSON: {e}", "_status": response.status_code, "_body": response.text[:500]}
+            return {"text": response.text, "content_type": content_type}
+
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            delay = 2 ** attempt + random.random()
+            logger.warning("network error %s (attempt=%s): %s; sleep=%.1fs", url, attempt + 1, e, delay)
+            last_err = {"_error": f"network: {type(e).__name__}", "_status": None}
+            await asyncio.sleep(delay)
+
+    return last_err
+
+
+def _is_error(result: dict) -> bool:
+    return isinstance(result, dict) and "_error" in result
+
 
 # ===== UniProt関連ツール =====
+
 
 @mcp.tool()
 async def search_proteins(query: str, organism: str = "Homo sapiens", size: int = 10, format: str = "json") -> str:
     """UniProtデータベースでタンパク質を検索（簡潔な結果を返す）
-    
+
     Args:
         query: 検索クエリ（タンパク質名、キーワードなど）
         organism: 生物種名（デフォルト: Homo sapiens）
         size: 結果数（1-50、デフォルト:10）
         format: 出力形式（json, tsv, fasta, xml）
     """
-    # バリデーション
     if not query or not query.strip():
-        return "エラー: 検索クエリが必要です"
-    
-    if size > 50:
-        size = 50  # 最大50件に制限
-    
-    # クエリ構築
-    search_query = query
+        return _err("検索クエリが必要です")
+    if format not in ("json", "tsv", "fasta", "xml"):
+        return _err(f"不正なformat: {format}")
+    size = max(1, min(size, 50))
+
+    search_query = _escape_lucene(query.strip())
     if organism:
-        search_query += f' AND organism_name:"{organism}"'
-    
+        search_query += f' AND organism_name:"{_escape_lucene(organism)}"'
+
     url = f"{APIs['uniprot']}/uniprotkb/search"
-    params = {
-        "query": search_query,
-        "format": format,
-        "size": size
-    }
-    
+    params = {"query": search_query, "format": format, "size": size}
+
     result = await make_api_request(url, params)
-    if result is None:
-        return "エラー: UniProt APIからのデータ取得に失敗しました"
-    
-    # JSON形式の場合、簡潔にフォーマット
+    if _is_error(result):
+        return _err("UniProt APIからのデータ取得に失敗しました", **result)
+
     if format == "json" and "results" in result and result["results"]:
         summary = {
             "query": query,
             "organism": organism,
             "total_found": len(result["results"]),
-            "proteins": []
+            "proteins": [
+                {
+                    "accession": p.get("primaryAccession"),
+                    "name": p.get("uniProtkbId"),
+                    "protein_name": p.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "名前不明"),
+                    "organism": p.get("organism", {}).get("scientificName", "不明"),
+                    "length": p.get("sequence", {}).get("length", "不明"),
+                    "reviewed": p.get("entryType", "").startswith("UniProtKB reviewed"),
+                }
+                for p in result["results"]
+            ],
         }
-        
-        for protein in result["results"]:
-            protein_summary = {
-                "accession": protein.get("primaryAccession"),
-                "name": protein.get("uniProtkbId"),
-                "protein_name": protein.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "名前不明"),
-                "organism": protein.get("organism", {}).get("scientificName", "不明"),
-                "length": protein.get("sequence", {}).get("length", "不明"),
-                "reviewed": protein.get("entryType", "").startswith("UniProtKB reviewed")
-            }
-            summary["proteins"].append(protein_summary)
-        
-        return json.dumps(summary, indent=2, ensure_ascii=False)
-    else:
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return _ok(summary)
+    return _ok(result)
+
 
 @mcp.tool()
 async def get_protein_info(accession: str, format: str = "json") -> str:
     """UniProtアクセッション番号から詳細情報を取得
-    
+
     Args:
         accession: UniProtアクセッション番号
         format: 出力形式（json, tsv, fasta, xml）
     """
     if not accession or not accession.strip():
-        return "エラー: アクセッション番号が必要です"
-    
-    url = f"{APIs['uniprot']}/uniprotkb/{accession}"
-    params = {"format": format}
-    
-    result = await make_api_request(url, params)
-    if result is None:
-        return f"エラー: アクセッション番号 {accession} の情報取得に失敗しました"
-    
+        return _err("アクセッション番号が必要です")
+    if format not in ("json", "tsv", "fasta", "xml"):
+        return _err(f"不正なformat: {format}")
+
+    acc = quote(accession.strip(), safe="")
+    url = f"{APIs['uniprot']}/uniprotkb/{acc}"
+    result = await make_api_request(url, {"format": format})
+    if _is_error(result):
+        return _err(f"アクセッション番号 {accession} の情報取得に失敗しました", **result)
+
     if format == "json":
-        return json.dumps(result, indent=2, ensure_ascii=False)
-    else:
-        return result.get("text", str(result))
+        return _ok(result)
+    return result.get("text", _ok(result))
+
 
 @mcp.tool()
 async def get_protein_sequence(accession: str, format: str = "fasta") -> str:
     """タンパク質のアミノ酸配列を取得
-    
+
     Args:
         accession: UniProtアクセッション番号
         format: 出力形式（fasta, json）
     """
     if not accession or not accession.strip():
-        return "エラー: アクセッション番号が必要です"
-    
-    url = f"{APIs['uniprot']}/uniprotkb/{accession}"
-    params = {"format": format}
-    
-    result = await make_api_request(url, params)
-    if result is None:
-        return f"エラー: アクセッション番号 {accession} の配列取得に失敗しました"
-    
+        return _err("アクセッション番号が必要です")
+    if format not in ("fasta", "json"):
+        return _err(f"不正なformat: {format}")
+
+    acc = quote(accession.strip(), safe="")
+    url = f"{APIs['uniprot']}/uniprotkb/{acc}"
+    result = await make_api_request(url, {"format": format})
+    if _is_error(result):
+        return _err(f"アクセッション番号 {accession} の配列取得に失敗しました", **result)
+
     if format == "fasta":
-        return result.get("text", str(result))
-    else:
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        return result.get("text", _ok(result))
+    return _ok(result)
+
 
 # ===== PDB関連ツール =====
+
 
 @mcp.tool()
 async def search_pdb_structures(query: str, size: int = 25) -> str:
     """RCSB PDBでタンパク質構造を検索
-    
+
     Args:
         query: 検索クエリ（タンパク質名、PDB IDなど）
         size: 結果数（1-100、デフォルト:25）
     """
     if not query or not query.strip():
-        return "エラー: 検索クエリが必要です"
-    
+        return _err("検索クエリが必要です")
     if size < 1 or size > 100:
-        return "エラー: サイズは1-100の範囲で指定してください"
-    
-    # PDB検索クエリ構築
+        return _err("サイズは1-100の範囲で指定してください")
+
     search_query = {
-        "query": {
-            "type": "terminal",
-            "service": "text",
-            "parameters": {
-                "value": query
-            }
-        },
+        "query": {"type": "terminal", "service": "text", "parameters": {"value": query}},
         "return_type": "entry",
         "request_options": {
             "return_all_hits": True,
             "results_verbosity": "minimal",
-            "sort": [{"sort_by": "score", "direction": "desc"}]
-        }
+            "sort": [{"sort_by": "score", "direction": "desc"}],
+        },
     }
-    
+
     result = await make_api_request(APIs["pdb_search"], json_data=search_query)
-    if result is None:
-        return "エラー: PDB検索に失敗しました"
-    
-    # 結果を制限
+    if _is_error(result):
+        return _err("PDB検索に失敗しました", **result)
+
     if "result_set" in result:
         result["result_set"] = result["result_set"][:size]
-    
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return _ok(result)
+
 
 @mcp.tool()
 async def get_pdb_structure_info(pdb_id: str) -> str:
     """PDB IDから構造詳細情報を取得
-    
+
     Args:
         pdb_id: PDB ID（4文字）
     """
-    if not pdb_id or len(pdb_id.strip()) != 4:
-        return "エラー: PDB IDは4文字である必要があります"
-    
-    pdb_id = pdb_id.upper()
-    url = f"{APIs['pdb']}/core/entry/{pdb_id}"
-    
+    if not pdb_id or len(pdb_id.strip()) != 4 or not pdb_id.strip().isalnum():
+        return _err("PDB IDは4文字の英数字である必要があります")
+
+    pid = quote(pdb_id.strip().upper(), safe="")
+    url = f"{APIs['pdb']}/core/entry/{pid}"
     result = await make_api_request(url)
-    if result is None:
-        return f"エラー: PDB ID {pdb_id} の構造情報取得に失敗しました"
-    
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    if _is_error(result):
+        return _err(f"PDB ID {pdb_id} の構造情報取得に失敗しました", **result)
+    return _ok(result)
+
 
 # ===== Reactome関連ツール =====
+
 
 @mcp.tool()
 async def search_pathways(query: str, species: str = "Homo sapiens") -> str:
     """Reactomeでバイオロジカルパスウェイを検索
-    
+
     Args:
         query: 検索クエリ（パスウェイ名、遺伝子名など）
         species: 生物種（デフォルト: Homo sapiens）
     """
     if not query or not query.strip():
-        return "エラー: 検索クエリが必要です"
-    
-    # Reactome APIの正しいエンドポイントを試行
-    # 1. 検索API (v1)
-    url = f"{APIs['reactome']}/data/query/{quote(query)}"
-    params = {"species": species}
-    
-    try:
-        result = await make_api_request(url, params)
-        if result is not None:
-            return json.dumps(result, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Reactome search v1 failed: {e}")
-    
-    # 2. 別の検索API形式を試行
-    try:
-        url2 = f"{APIs['reactome']}/data/entities/{quote(query)}"
-        result2 = await make_api_request(url2, {"species": species})
-        if result2 is not None:
-            return json.dumps(result2, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Reactome entities API failed: {e}")
-    
-    # 3. 汎用検索APIを試行
-    try:
-        url3 = f"{APIs['reactome']}/data/search/query"
-        params3 = {"q": query, "species": species, "types": "Pathway"}
-        result3 = await make_api_request(url3, params3)
-        if result3 is not None:
-            return json.dumps(result3, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Reactome search query API failed: {e}")
-    
-    # 4. すべて失敗した場合はモックデータを返す
-    mock_result = {
-        "query": query,
-        "species": species,
-        "note": "Reactome API接続に問題があるため、モックデータを返しています",
-        "pathways": [
-            {
-                "stId": "R-HSA-70171",
-                "displayName": f"{query}に関連するパスウェイ（例）",
-                "species": species,
-                "type": "Pathway"
-            }
-        ]
-    }
-    
-    return json.dumps(mock_result, indent=2, ensure_ascii=False)
+        return _err("検索クエリが必要です")
+
+    q = quote(query.strip(), safe="")
+    errors: list[dict] = []
+
+    # 1. query/entities エンドポイントを順に試行
+    for path in (f"/data/query/{q}", f"/data/entities/{q}"):
+        result = await make_api_request(f"{APIs['reactome']}{path}", {"species": species})
+        if not _is_error(result):
+            return _ok(result)
+        errors.append({"endpoint": path, **result})
+
+    # 2. 検索クエリAPI
+    result = await make_api_request(
+        f"{APIs['reactome']}/data/search/query",
+        {"q": query.strip(), "species": species, "types": "Pathway"},
+    )
+    if not _is_error(result):
+        return _ok(result)
+    errors.append({"endpoint": "/data/search/query", **result})
+
+    return _err(
+        "Reactomeパスウェイの取得に失敗しました",
+        query=query,
+        species=species,
+        attempts=errors,
+        suggestion=f"https://reactome.org/content/query?q={q}",
+    )
+
 
 @mcp.tool()
 async def get_protein_pathways(accession: str) -> str:
     """タンパク質が関与するパスウェイを取得（Reactome AnalysisService使用）
-    
+
     Args:
         accession: UniProtアクセッション番号
     """
     if not accession or not accession.strip():
-        return "エラー: アクセッション番号が必要です"
-    
-    try:
-        # 1. Reactome AnalysisServiceを使用
-        analysis_url = f"{APIs['reactome_analysis']}/identifiers"
-        params = {
+        return _err("アクセッション番号が必要です")
+    acc = accession.strip()
+
+    # 1. Reactome AnalysisService
+    analysis = await make_api_request(
+        f"{APIs['reactome_analysis']}/identifiers",
+        params={
             "interactors": "false",
             "pageSize": "20",
             "page": "1",
             "sortBy": "ENTITIES_PVALUE",
             "order": "ASC",
-            "resource": "TOTAL"
-        }
-        
-        # 単一のアクセッション番号を送信
-        async with httpx.AsyncClient(headers=CLIENT_HEADERS, timeout=30.0) as client:
-            response = await client.post(
-                analysis_url,
-                params=params,
-                data=accession,
-                headers={"Content-Type": "text/plain"}
-            )
-            
-            if response.status_code == 200:
-                analysis_result = response.json()
-                
-                pathway_result = {
-                    "accession": accession,
-                    "analysis_summary": analysis_result.get("summary", {}),
-                    "pathways": [],
-                    "method": "Reactome AnalysisService",
-                    "timestamp": analysis_result.get("summary", {}).get("createdOn")
+            "resource": "TOTAL",
+        },
+        content=acc,
+        extra_headers={"Content-Type": "text/plain"},
+        use_cache=False,
+    )
+
+    if not _is_error(analysis):
+        out = {
+            "accession": acc,
+            "analysis_summary": analysis.get("summary", {}),
+            "pathways": [
+                {
+                    "stId": p.get("stId"),
+                    "name": p.get("name"),
+                    "species": p.get("species", {}).get("name"),
+                    "entities_found": p.get("entities", {}).get("found", 0),
+                    "entities_total": p.get("entities", {}).get("total", 0),
+                    "p_value": p.get("entities", {}).get("pValue"),
+                    "fdr": p.get("entities", {}).get("fdr"),
+                    "url": f"https://reactome.org/PathwayBrowser/#/{p.get('stId')}",
+                    "details_url": f"https://reactome.org/detail/{p.get('stId')}",
                 }
-                
-                # パスウェイ情報を抽出
-                if "pathways" in analysis_result:
-                    for pathway in analysis_result["pathways"]:
-                        pathway_info = {
-                            "stId": pathway.get("stId"),
-                            "name": pathway.get("name"),
-                            "species": pathway.get("species", {}).get("name"),
-                            "entities_found": pathway.get("entities", {}).get("found", 0),
-                            "entities_total": pathway.get("entities", {}).get("total", 0),
-                            "p_value": pathway.get("entities", {}).get("pValue"),
-                            "fdr": pathway.get("entities", {}).get("fdr"),
-                            "url": f"https://reactome.org/PathwayBrowser/#/{pathway.get('stId')}",
-                            "details_url": f"https://reactome.org/detail/{pathway.get('stId')}"
-                        }
-                        pathway_result["pathways"].append(pathway_info)
-                
-                # トークンが返される場合は保存
-                if "summary" in analysis_result and "token" in analysis_result["summary"]:
-                    pathway_result["analysis_token"] = analysis_result["summary"]["token"]
-                    pathway_result["analysis_url"] = f"https://reactome.org/PathwayBrowser/#/DTAB=AN&ANALYSIS={analysis_result['summary']['token']}"
-                
-                return json.dumps(pathway_result, indent=2, ensure_ascii=False)
-            
-            else:
-                logger.warning(f"Reactome Analysis API returned {response.status_code}")
-                
-    except Exception as e:
-        logger.error(f"Reactome analysis failed for {accession}: {e}")
-    
-    # フォールバック: UniProtからパスウェイ情報を取得
-    try:
-        logger.info(f"Using UniProt fallback for pathway info: {accession}")
-        
-        uniprot_url = f"{APIs['uniprot']}/uniprotkb/{accession}"
-        uniprot_result = await make_api_request(uniprot_url, {"format": "json"})
-        
-        if uniprot_result:
-            pathway_info = {
-                "accession": accession,
-                "source": "UniProt (Reactome AnalysisService fallback)",
-                "pathways": [],
-                "cross_references": [],
-                "protein_name": uniprot_result.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "Unknown")
+                for p in analysis.get("pathways", [])
+            ],
+            "method": "Reactome AnalysisService",
+            "timestamp": analysis.get("summary", {}).get("createdOn"),
+        }
+        token = analysis.get("summary", {}).get("token")
+        if token:
+            out["analysis_token"] = token
+            out["analysis_url"] = f"https://reactome.org/PathwayBrowser/#/DTAB=AN&ANALYSIS={token}"
+        return _ok(out)
+
+    logger.info("Reactome AnalysisService failed, falling back to UniProt for %s", acc)
+
+    # 2. UniProtフォールバック
+    acc_enc = quote(acc, safe="")
+    uni = await make_api_request(f"{APIs['uniprot']}/uniprotkb/{acc_enc}", {"format": "json"})
+    if _is_error(uni):
+        return _err(
+            "パスウェイ情報の取得に失敗しました",
+            accession=acc,
+            reactome_error=analysis,
+            uniprot_error=uni,
+            suggestion=f"https://reactome.org/content/query?q={acc_enc}",
+        )
+
+    info: dict[str, Any] = {
+        "accession": acc,
+        "source": "UniProt (Reactome AnalysisService fallback)",
+        "pathways": [],
+        "cross_references": [],
+        "protein_name": uni.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "Unknown"),
+    }
+    for ref in uni.get("uniProtKBCrossReferences", []):
+        if ref.get("database") == "Reactome":
+            entry = {
+                "id": ref.get("id"),
+                "url": f"https://reactome.org/detail/{ref.get('id')}",
+                "source": "UniProt cross-reference",
             }
-            
-            # Reactome相互参照を抽出
-            if "uniProtKBCrossReferences" in uniprot_result:
-                for ref in uniprot_result["uniProtKBCrossReferences"]:
-                    if ref.get("database") == "Reactome":
-                        reactome_info = {
-                            "id": ref.get("id"),
-                            "url": f"https://reactome.org/detail/{ref.get('id')}",
-                            "source": "UniProt cross-reference"
-                        }
-                        # プロパティから説明を抽出
-                        if "properties" in ref:
-                            for prop in ref["properties"]:
-                                if prop.get("key") == "PathwayName":
-                                    reactome_info["pathway_name"] = prop.get("value")
-                        
-                        pathway_info["cross_references"].append(reactome_info)
-            
-            # コメントからパスウェイ関連情報を抽出
-            if "comments" in uniprot_result:
-                for comment in uniprot_result["comments"]:
-                    if comment.get("commentType") in ["PATHWAY", "FUNCTION"]:
-                        pathway_comment = {
-                            "type": comment.get("commentType"),
-                            "text": comment.get("texts", [{}])[0].get("value", ""),
-                            "source": "UniProt annotation"
-                        }
-                        pathway_info["pathways"].append(pathway_comment)
-            
-            return json.dumps(pathway_info, indent=2, ensure_ascii=False)
-    
-    except Exception as e:
-        logger.error(f"UniProt fallback also failed for {accession}: {e}")
-    
-    # 最終フォールバック
-    return json.dumps({
-        "accession": accession,
-        "error": "パスウェイ情報の取得に失敗しました",
-        "suggestion": f"Reactome Webサイトで直接検索: https://reactome.org/content/query?q={accession}",
-        "uniprot_url": f"https://www.uniprot.org/uniprot/{accession}"
-    }, indent=2, ensure_ascii=False)
+            for prop in ref.get("properties", []):
+                if prop.get("key") == "PathwayName":
+                    entry["pathway_name"] = prop.get("value")
+            info["cross_references"].append(entry)
+    for comment in uni.get("comments", []):
+        if comment.get("commentType") in ("PATHWAY", "FUNCTION"):
+            info["pathways"].append(
+                {
+                    "type": comment.get("commentType"),
+                    "text": (comment.get("texts") or [{}])[0].get("value", ""),
+                    "source": "UniProt annotation",
+                }
+            )
+    return _ok(info)
+
 
 # ===== Gene Ontology関連ツール =====
 
+
 @mcp.tool()
-async def search_go_terms(go_term: str = None, query: str = None) -> str:
+async def search_go_terms(go_term: Optional[str] = None, query: Optional[str] = None) -> str:
     """Gene Ontology用語を検索
-    
+
     Args:
         go_term: GO term ID（例: GO:0005524）
         query: 検索クエリ（go_termまたはqueryのいずれかが必要）
     """
     if not go_term and not query:
-        return "エラー: GO term IDまたは検索クエリが必要です"
-    
+        return _err("GO term IDまたは検索クエリが必要です")
+
     if go_term:
-        # 特定のGO termの詳細を取得
-        url = f"{APIs['go']}/bioentity/{go_term}"
+        url = f"{APIs['go']}/bioentity/{quote(go_term.strip(), safe=':')}"
     else:
-        # クエリで検索
-        url = f"{APIs['go']}/search/entity/{quote(query)}"
-    
+        url = f"{APIs['go']}/search/entity/{quote(query.strip(), safe='')}"
+
     result = await make_api_request(url)
-    if result is None:
-        return "エラー: Gene Ontology検索に失敗しました"
-    
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    if _is_error(result):
+        return _err("Gene Ontology検索に失敗しました", **result)
+    return _ok(result)
+
 
 # ===== 統合分析ツール =====
+
 
 @mcp.tool()
 async def comprehensive_protein_analysis(accession: str) -> str:
     """タンパク質の包括的分析（UniProt + Reactome + PDB統合）
-    
+
     Args:
         accession: UniProtアクセッション番号
     """
     if not accession or not accession.strip():
-        return "エラー: アクセッション番号が必要です"
-    
-    analysis_result = {
-        "accession": accession,
+        return _err("アクセッション番号が必要です")
+    acc = accession.strip()
+    acc_enc = quote(acc, safe="")
+
+    pdb_query = {
+        "query": {"type": "terminal", "service": "text", "parameters": {"value": acc}},
+        "return_type": "entry",
+        "request_options": {
+            "return_all_hits": True,
+            "results_verbosity": "minimal",
+            "sort": [{"sort_by": "score", "direction": "desc"}],
+        },
+    }
+
+    uniprot_task = make_api_request(f"{APIs['uniprot']}/uniprotkb/{acc_enc}", {"format": "json"})
+    pathways_task = make_api_request(f"{APIs['reactome']}/data/participants/{acc_enc}/pathways")
+    pdb_task = make_api_request(APIs["pdb_search"], json_data=pdb_query)
+
+    uniprot_result, pathway_result, pdb_result = await asyncio.gather(
+        uniprot_task, pathways_task, pdb_task, return_exceptions=True
+    )
+
+    analysis: dict[str, Any] = {
+        "accession": acc,
         "uniprot_info": None,
         "pathways": None,
         "pdb_structures": None,
-        "error_messages": []
+        "error_messages": [],
     }
-    
-    # UniProt情報取得
-    try:
-        uniprot_url = f"{APIs['uniprot']}/uniprotkb/{accession}"
-        uniprot_result = await make_api_request(uniprot_url, {"format": "json"})
-        if uniprot_result:
-            analysis_result["uniprot_info"] = uniprot_result
-        else:
-            analysis_result["error_messages"].append("UniProt情報の取得に失敗")
-    except Exception as e:
-        analysis_result["error_messages"].append(f"UniProt取得エラー: {str(e)}")
-    
-    # Reactomeパスウェイ情報取得
-    try:
-        pathway_url = f"{APIs['reactome']}/data/participants/{accession}/pathways"
-        pathway_result = await make_api_request(pathway_url)
-        if pathway_result:
-            analysis_result["pathways"] = pathway_result
-        else:
-            analysis_result["error_messages"].append("パスウェイ情報の取得に失敗")
-    except Exception as e:
-        analysis_result["error_messages"].append(f"パスウェイ取得エラー: {str(e)}")
-    
-    # PDB構造検索（UniProt IDで）
-    try:
-        pdb_search_query = {
-            "query": {
-                "type": "terminal",
-                "service": "text",
-                "parameters": {"value": accession}
-            },
-            "return_type": "entry",
-            "request_options": {
-                "return_all_hits": True,
-                "results_verbosity": "minimal",
-                "sort": [{"sort_by": "score", "direction": "desc"}]
-            }
+
+    if isinstance(uniprot_result, Exception) or _is_error(uniprot_result):
+        analysis["error_messages"].append({"source": "uniprot", "detail": str(uniprot_result)})
+    else:
+        analysis["uniprot_info"] = uniprot_result
+
+    if isinstance(pathway_result, Exception) or _is_error(pathway_result):
+        analysis["error_messages"].append({"source": "reactome", "detail": str(pathway_result)})
+    else:
+        analysis["pathways"] = pathway_result
+
+    if isinstance(pdb_result, Exception) or _is_error(pdb_result):
+        analysis["error_messages"].append({"source": "pdb", "detail": str(pdb_result)})
+    elif "result_set" in pdb_result:
+        analysis["pdb_structures"] = {
+            "result_set": pdb_result["result_set"][:5],
+            "total_count": pdb_result.get("total_count", 0),
         }
-        pdb_result = await make_api_request(APIs["pdb_search"], json_data=pdb_search_query)
-        if pdb_result and "result_set" in pdb_result:
-            # 結果を5件に制限
-            analysis_result["pdb_structures"] = {
-                "result_set": pdb_result["result_set"][:5],
-                "total_count": pdb_result.get("total_count", 0)
-            }
-        else:
-            analysis_result["error_messages"].append("PDB構造情報の取得に失敗")
-    except Exception as e:
-        analysis_result["error_messages"].append(f"PDB検索エラー: {str(e)}")
-    
-    return json.dumps(analysis_result, indent=2, ensure_ascii=False)
+    else:
+        analysis["pdb_structures"] = pdb_result
+
+    return _ok(analysis)
+
 
 # ===== 追加の便利ツール =====
+
 
 @mcp.tool()
 async def get_primary_protein_for_gene(gene: str, organism: str = "Homo sapiens") -> str:
     """遺伝子に対応する主要なタンパク質情報を取得（最も関連性の高い1つのみ）
-    
+
     Args:
         gene: 遺伝子名またはシンボル（例: APP, BRCA1, INS）
         organism: 生物種名（デフォルト: Homo sapiens）
     """
     if not gene or not gene.strip():
-        return "エラー: 遺伝子名が必要です"
-    
-    # レビュー済みのエントリを優先して検索
-    search_query = f'gene:"{gene}" AND organism_name:"{organism}" AND reviewed:true'
-    
-    url = f"{APIs['uniprot']}/uniprotkb/search"
-    params = {
-        "query": search_query,
-        "format": "json",
-        "size": 1  # 最も関連性の高い1つのみ
+        return _err("遺伝子名が必要です")
+
+    g = _escape_lucene(gene.strip())
+    o = _escape_lucene(organism)
+    search_query = f'gene:"{g}" AND organism_name:"{o}" AND reviewed:true'
+
+    result = await make_api_request(
+        f"{APIs['uniprot']}/uniprotkb/search",
+        {"query": search_query, "format": "json", "size": 1},
+    )
+    if _is_error(result):
+        return _err(f"遺伝子 {gene} の検索に失敗しました", **result)
+
+    if not result.get("results"):
+        return _err(f"遺伝子 {gene} ({organism}) に対応するレビュー済みタンパク質が見つかりませんでした")
+
+    p = result["results"][0]
+    primary = {
+        "gene": gene,
+        "organism": organism,
+        "primary_protein": {
+            "accession": p.get("primaryAccession"),
+            "name": p.get("uniProtkbId"),
+            "protein_name": p.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "名前不明"),
+            "organism": p.get("organism", {}).get("scientificName", "不明"),
+            "length": p.get("sequence", {}).get("length", "不明"),
+            "reviewed": p.get("entryType", "").startswith("UniProtKB reviewed"),
+            "function": None,
+        },
     }
-    
-    result = await make_api_request(url, params)
-    if result is None:
-        return f"エラー: 遺伝子 {gene} の検索に失敗しました"
-    
-    if "results" in result and result["results"]:
-        protein = result["results"][0]
-        
-        primary_info = {
-            "gene": gene,
-            "organism": organism,
-            "primary_protein": {
-                "accession": protein.get("primaryAccession"),
-                "name": protein.get("uniProtkbId"),
-                "protein_name": protein.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "名前不明"),
-                "organism": protein.get("organism", {}).get("scientificName", "不明"),
-                "length": protein.get("sequence", {}).get("length", "不明"),
-                "reviewed": protein.get("entryType", "").startswith("UniProtKB reviewed"),
-                "function": None
-            }
-        }
-        
-        # 機能情報を追加
-        comments = protein.get("comments", [])
-        for comment in comments:
-            if comment.get("commentType") == "FUNCTION":
-                primary_info["primary_protein"]["function"] = comment.get("texts", [{}])[0].get("value", "")
-                break
-        
-        return json.dumps(primary_info, indent=2, ensure_ascii=False)
-    else:
-        return f"遺伝子 {gene} ({organism}) に対応するレビュー済みタンパク質が見つかりませんでした"
+    for comment in p.get("comments", []):
+        if comment.get("commentType") == "FUNCTION":
+            primary["primary_protein"]["function"] = (comment.get("texts") or [{}])[0].get("value", "")
+            break
+    return _ok(primary)
+
 
 @mcp.tool()
 async def get_protein_features(accession: str) -> str:
     """タンパク質の機能的特徴とドメイン情報を取得
-    
+
     Args:
         accession: UniProtアクセッション番号
     """
     if not accession or not accession.strip():
-        return "エラー: アクセッション番号が必要です"
-    
-    url = f"{APIs['uniprot']}/uniprotkb/{accession}"
-    params = {"format": "json"}
-    
-    result = await make_api_request(url, params)
-    if result is None:
-        return f"エラー: アクセッション番号 {accession} の特徴情報取得に失敗しました"
-    
-    # 特徴情報を抽出
-    features_info = {
+        return _err("アクセッション番号が必要です")
+
+    acc = quote(accession.strip(), safe="")
+    result = await make_api_request(f"{APIs['uniprot']}/uniprotkb/{acc}", {"format": "json"})
+    if _is_error(result):
+        return _err(f"アクセッション番号 {accession} の特徴情報取得に失敗しました", **result)
+
+    features = result.get("features", [])
+    return _ok({
         "accession": result.get("primaryAccession"),
         "name": result.get("uniProtkbId"),
-        "features": result.get("features", []),
+        "features": features,
         "comments": result.get("comments", []),
         "keywords": result.get("keywords", []),
-        "domains": [f for f in result.get("features", []) if f.get("type") == "Domain"],
-        "active_sites": [f for f in result.get("features", []) if f.get("type") == "Active site"],
-        "binding_sites": [f for f in result.get("features", []) if f.get("type") == "Binding site"]
-    }
-    
-    return json.dumps(features_info, indent=2, ensure_ascii=False)
+        "domains": [f for f in features if f.get("type") == "Domain"],
+        "active_sites": [f for f in features if f.get("type") == "Active site"],
+        "binding_sites": [f for f in features if f.get("type") == "Binding site"],
+    })
+
 
 @mcp.tool()
 async def search_by_gene(gene: str, organism: str = "Homo sapiens", size: int = 10) -> str:
     """遺伝子名でタンパク質を検索（簡潔な結果を返す）
-    
+
     Args:
         gene: 遺伝子名またはシンボル（例: BRCA1, INS, APP）
         organism: 生物種名（デフォルト: Homo sapiens）
         size: 結果数（1-50、デフォルト:10）
     """
     if not gene or not gene.strip():
-        return "エラー: 遺伝子名が必要です"
-    
-    if size > 50:
-        size = 50  # 最大50件に制限
-    
-    # クエリ構築
-    search_query = f'gene:"{gene}"'
+        return _err("遺伝子名が必要です")
+    size = max(1, min(size, 50))
+
+    g = _escape_lucene(gene.strip())
+    search_query = f'gene:"{g}"'
     if organism:
-        search_query += f' AND organism_name:"{organism}"'
-    
-    url = f"{APIs['uniprot']}/uniprotkb/search"
-    params = {
-        "query": search_query,
-        "format": "json",
-        "size": size
-    }
-    
-    result = await make_api_request(url, params)
-    if result is None:
-        return f"エラー: 遺伝子 {gene} の検索に失敗しました"
-    
-    # 結果を簡潔にフォーマット
-    if "results" in result and result["results"]:
-        summary = {
-            "gene": gene,
-            "organism": organism,
-            "total_found": len(result["results"]),
-            "proteins": []
-        }
-        
-        for protein in result["results"]:
-            protein_summary = {
-                "accession": protein.get("primaryAccession"),
-                "name": protein.get("uniProtkbId"),
-                "protein_name": protein.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "名前不明"),
-                "length": protein.get("sequence", {}).get("length", "不明"),
-                "reviewed": protein.get("entryType", "").startswith("UniProtKB reviewed")
+        search_query += f' AND organism_name:"{_escape_lucene(organism)}"'
+
+    result = await make_api_request(
+        f"{APIs['uniprot']}/uniprotkb/search",
+        {"query": search_query, "format": "json", "size": size},
+    )
+    if _is_error(result):
+        return _err(f"遺伝子 {gene} の検索に失敗しました", **result)
+
+    if not result.get("results"):
+        return _err(f"遺伝子 {gene} に関連するタンパク質が見つかりませんでした")
+
+    summary = {
+        "gene": gene,
+        "organism": organism,
+        "total_found": len(result["results"]),
+        "proteins": [
+            {
+                "accession": p.get("primaryAccession"),
+                "name": p.get("uniProtkbId"),
+                "protein_name": p.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "名前不明"),
+                "length": p.get("sequence", {}).get("length", "不明"),
+                "reviewed": p.get("entryType", "").startswith("UniProtKB reviewed"),
             }
-            summary["proteins"].append(protein_summary)
-        
-        return json.dumps(summary, indent=2, ensure_ascii=False)
-    else:
-        return f"遺伝子 {gene} に関連するタンパク質が見つかりませんでした"
+            for p in result["results"]
+        ],
+    }
+    return _ok(summary)
+
 
 if __name__ == "__main__":
-    # サーバーを起動
-    mcp.run(transport='stdio')
+    mcp.run(transport="stdio")
