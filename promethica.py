@@ -519,17 +519,25 @@ async def comprehensive_protein_analysis(accession: str) -> str:
     acc_enc = quote(acc, safe="")
 
     pdb_query = {
-        "query": {"type": "terminal", "service": "text", "parameters": {"value": acc}},
+        "query": {
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
+                "operator": "exact_match",
+                "value": acc,
+            },
+        },
         "return_type": "entry",
         "request_options": {
-            "return_all_hits": True,
+            "paginate": {"start": 0, "rows": 25},
             "results_verbosity": "minimal",
             "sort": [{"sort_by": "score", "direction": "desc"}],
         },
     }
 
     uniprot_task = make_api_request(f"{APIs['uniprot']}/uniprotkb/{acc_enc}", {"format": "json"})
-    pathways_task = make_api_request(f"{APIs['reactome']}/data/participants/{acc_enc}/pathways")
+    pathways_task = make_api_request(f"{APIs['reactome']}/mapping/UniProt/{acc_enc}/pathways")
     pdb_task = make_api_request(APIs["pdb_search"], json_data=pdb_query)
 
     uniprot_result, pathway_result, pdb_result = await asyncio.gather(
