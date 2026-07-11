@@ -151,6 +151,74 @@ def _is_error(result: dict) -> bool:
     return isinstance(result, dict) and "_error" in result
 
 
+# ===== UniProtフィールドフィルタ =====
+
+# UniProt JSONレスポンスの主要トップレベルキー → 論理フィールド名のマッピング
+# "references" は文献情報で非常に大きくなるため、デフォルトでは除外する
+UNIPROT_FIELD_MAP: dict[str, list[str]] = {
+    "basic": ["primaryAccession", "uniProtkbId", "entryType", "annotationScore"],
+    "protein_name": ["proteinDescription"],
+    "organism": ["organism", "organismHosts"],
+    "gene": ["genes"],
+    "function": ["comments"],
+    "features": ["features"],
+    "keywords": ["keywords"],
+    "sequence": ["sequence"],
+    "subcellular_location": ["comments"],
+    "disease": ["comments"],
+    "interaction": ["comments"],
+    "cross_references": ["uniProtKBCrossReferences"],
+    "references": ["references", "citations"],
+    "go_annotations": ["uniProtKBCrossReferences"],
+    "structure": ["uniProtKBCrossReferences"],
+    "secondary_accessions": ["secondaryAccessions"],
+    "entry_audit": ["entryAudit"],
+}
+
+# デフォルトで返すフィールド（references を除外した軽量版）
+DEFAULT_FIELDS = [
+    "basic", "protein_name", "organism", "gene", "function",
+    "features", "keywords", "sequence", "cross_references",
+]
+
+# すべてのフィールド
+ALL_FIELD_NAMES = sorted(UNIPROT_FIELD_MAP.keys())
+
+
+def _filter_uniprot_response(data: dict, fields: Optional[list[str]] = None) -> dict:
+    """UniProt JSONレスポンスを指定フィールドでフィルタする。
+
+    fields が None の場合はデフォルト（references除外）を適用。
+    fields に "all" が含まれる場合はフィルタなしで全データを返す。
+    """
+    if not isinstance(data, dict):
+        return data
+
+    if fields is not None and "all" in fields:
+        return data
+
+    selected = fields if fields is not None else DEFAULT_FIELDS
+
+    # 許可するトップレベルキーを収集
+    allowed_keys: set[str] = set()
+    for field_name in selected:
+        if field_name in UNIPROT_FIELD_MAP:
+            allowed_keys.update(UNIPROT_FIELD_MAP[field_name])
+
+    # basic は常に含める
+    allowed_keys.update(UNIPROT_FIELD_MAP["basic"])
+
+    filtered = {k: v for k, v in data.items() if k in allowed_keys}
+
+    # メタ情報として、除外されたフィールドがあることを示す
+    excluded = [f for f in ALL_FIELD_NAMES if f not in selected and f != "basic"]
+    if excluded:
+        filtered["_excluded_fields"] = excluded
+        filtered["_hint"] = "除外フィールドが必要な場合は fields パラメータで指定してください（例: fields=['references']）。全データは fields=['all'] で取得できます。"
+
+    return filtered
+
+
 # ===== UniProt関連ツール =====
 
 
@@ -203,12 +271,21 @@ async def search_proteins(query: str, organism: str = "Homo sapiens", size: int 
 
 
 @mcp.tool()
-async def get_protein_info(accession: str, format: str = "json") -> str:
+async def get_protein_info(
+    accession: str,
+    format: str = "json",
+    fields: Optional[list[str]] = None,
+) -> str:
     """UniProtアクセッション番号から詳細情報を取得
 
     Args:
         accession: UniProtアクセッション番号
         format: 出力形式（json, tsv, fasta, xml）
+        fields: 取得するフィールド一覧（デフォルト: references除外の軽量版）。
+                指定可能: basic, protein_name, organism, gene, function, features,
+                keywords, sequence, cross_references, references, disease,
+                interaction, go_annotations, structure, secondary_accessions, entry_audit。
+                全データ取得は fields=["all"]。
     """
     if not accession or not accession.strip():
         return _err("アクセッション番号が必要です")
@@ -222,7 +299,7 @@ async def get_protein_info(accession: str, format: str = "json") -> str:
         return _err(f"アクセッション番号 {accession} の情報取得に失敗しました", **result)
 
     if format == "json":
-        return _ok(result)
+        return _ok(_filter_uniprot_response(result, fields))
     return result.get("text", _ok(result))
 
 
@@ -507,70 +584,100 @@ async def search_go_terms(go_term: Optional[str] = None, query: Optional[str] = 
 
 
 @mcp.tool()
-async def comprehensive_protein_analysis(accession: str) -> str:
+async def comprehensive_protein_analysis(
+    accession: str,
+    fields: Optional[list[str]] = None,
+    sources: Optional[list[str]] = None,
+    max_pdb_results: int = 5,
+) -> str:
     """タンパク質の包括的分析（UniProt + Reactome + PDB統合）
 
     Args:
         accession: UniProtアクセッション番号
+        fields: UniProt情報のフィールド指定（get_protein_infoと同じ。デフォルト: references除外の軽量版）。
+                全データ取得は fields=["all"]。
+        sources: 取得するデータソース一覧（デフォルト: ["uniprot", "reactome", "pdb"]）。
+                 一部のみ指定して高速化可能（例: sources=["uniprot"]）。
+        max_pdb_results: 返すPDB構造の最大数（デフォルト: 5）
     """
     if not accession or not accession.strip():
         return _err("アクセッション番号が必要です")
     acc = accession.strip()
     acc_enc = quote(acc, safe="")
 
-    pdb_query = {
-        "query": {
-            "type": "terminal",
-            "service": "text",
-            "parameters": {
-                "attribute": "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
-                "operator": "exact_match",
-                "value": acc,
+    active_sources = set(sources) if sources else {"uniprot", "reactome", "pdb"}
+
+    # 各ソースのタスクを必要に応じて作成
+    uniprot_task = None
+    pathways_task = None
+    pdb_task = None
+
+    if "uniprot" in active_sources:
+        uniprot_task = make_api_request(f"{APIs['uniprot']}/uniprotkb/{acc_enc}", {"format": "json"})
+
+    if "reactome" in active_sources:
+        pathways_task = make_api_request(f"{APIs['reactome']}/mapping/UniProt/{acc_enc}/pathways")
+
+    if "pdb" in active_sources:
+        pdb_query = {
+            "query": {
+                "type": "terminal",
+                "service": "text",
+                "parameters": {
+                    "attribute": "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
+                    "operator": "exact_match",
+                    "value": acc,
+                },
             },
-        },
-        "return_type": "entry",
-        "request_options": {
-            "paginate": {"start": 0, "rows": 25},
-            "results_verbosity": "minimal",
-            "sort": [{"sort_by": "score", "direction": "desc"}],
-        },
-    }
+            "return_type": "entry",
+            "request_options": {
+                "paginate": {"start": 0, "rows": max(max_pdb_results, 25)},
+                "results_verbosity": "minimal",
+                "sort": [{"sort_by": "score", "direction": "desc"}],
+            },
+        }
+        pdb_task = make_api_request(APIs["pdb_search"], json_data=pdb_query)
 
-    uniprot_task = make_api_request(f"{APIs['uniprot']}/uniprotkb/{acc_enc}", {"format": "json"})
-    pathways_task = make_api_request(f"{APIs['reactome']}/mapping/UniProt/{acc_enc}/pathways")
-    pdb_task = make_api_request(APIs["pdb_search"], json_data=pdb_query)
+    # 有効なタスクだけ並列実行
+    tasks = [t for t in (uniprot_task, pathways_task, pdb_task) if t is not None]
+    results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+    result_iter = iter(results)
 
-    uniprot_result, pathway_result, pdb_result = await asyncio.gather(
-        uniprot_task, pathways_task, pdb_task, return_exceptions=True
-    )
+    uniprot_result = next(result_iter) if uniprot_task else None
+    pathway_result = next(result_iter) if pathways_task else None
+    pdb_result = next(result_iter) if pdb_task else None
 
     analysis: dict[str, Any] = {
         "accession": acc,
         "uniprot_info": None,
         "pathways": None,
         "pdb_structures": None,
+        "active_sources": sorted(active_sources),
         "error_messages": [],
     }
 
-    if isinstance(uniprot_result, Exception) or _is_error(uniprot_result):
-        analysis["error_messages"].append({"source": "uniprot", "detail": str(uniprot_result)})
-    else:
-        analysis["uniprot_info"] = uniprot_result
+    if uniprot_result is not None:
+        if isinstance(uniprot_result, Exception) or _is_error(uniprot_result):
+            analysis["error_messages"].append({"source": "uniprot", "detail": str(uniprot_result)})
+        else:
+            analysis["uniprot_info"] = _filter_uniprot_response(uniprot_result, fields)
 
-    if isinstance(pathway_result, Exception) or _is_error(pathway_result):
-        analysis["error_messages"].append({"source": "reactome", "detail": str(pathway_result)})
-    else:
-        analysis["pathways"] = pathway_result
+    if pathway_result is not None:
+        if isinstance(pathway_result, Exception) or _is_error(pathway_result):
+            analysis["error_messages"].append({"source": "reactome", "detail": str(pathway_result)})
+        else:
+            analysis["pathways"] = pathway_result
 
-    if isinstance(pdb_result, Exception) or _is_error(pdb_result):
-        analysis["error_messages"].append({"source": "pdb", "detail": str(pdb_result)})
-    elif "result_set" in pdb_result:
-        analysis["pdb_structures"] = {
-            "result_set": pdb_result["result_set"][:5],
-            "total_count": pdb_result.get("total_count", 0),
-        }
-    else:
-        analysis["pdb_structures"] = pdb_result
+    if pdb_result is not None:
+        if isinstance(pdb_result, Exception) or _is_error(pdb_result):
+            analysis["error_messages"].append({"source": "pdb", "detail": str(pdb_result)})
+        elif "result_set" in pdb_result:
+            analysis["pdb_structures"] = {
+                "result_set": pdb_result["result_set"][:max_pdb_results],
+                "total_count": pdb_result.get("total_count", 0),
+            }
+        else:
+            analysis["pdb_structures"] = pdb_result
 
     return _ok(analysis)
 
@@ -625,11 +732,22 @@ async def get_primary_protein_for_gene(gene: str, organism: str = "Homo sapiens"
 
 
 @mcp.tool()
-async def get_protein_features(accession: str) -> str:
+async def get_protein_features(
+    accession: str,
+    feature_types: Optional[list[str]] = None,
+    include_comments: bool = True,
+    include_keywords: bool = True,
+    max_features: int = 100,
+) -> str:
     """タンパク質の機能的特徴とドメイン情報を取得
 
     Args:
         accession: UniProtアクセッション番号
+        feature_types: 取得するfeatureタイプの一覧（例: ["Domain", "Active site", "Binding site"]）。
+                       Noneの場合は全タイプを返す。
+        include_comments: commentsセクションを含めるか（デフォルト: True）
+        include_keywords: keywordsセクションを含めるか（デフォルト: True）
+        max_features: 返すfeaturesの最大数（デフォルト: 100）
     """
     if not accession or not accession.strip():
         return _err("アクセッション番号が必要です")
@@ -640,16 +758,37 @@ async def get_protein_features(accession: str) -> str:
         return _err(f"アクセッション番号 {accession} の特徴情報取得に失敗しました", **result)
 
     features = result.get("features", [])
-    return _ok({
+
+    # feature_types が指定されていればフィルタ
+    if feature_types:
+        type_set = set(feature_types)
+        features = [f for f in features if f.get("type") in type_set]
+
+    total_features = len(features)
+    features = features[:max_features]
+
+    out: dict[str, Any] = {
         "accession": result.get("primaryAccession"),
         "name": result.get("uniProtkbId"),
         "features": features,
-        "comments": result.get("comments", []),
-        "keywords": result.get("keywords", []),
-        "domains": [f for f in features if f.get("type") == "Domain"],
-        "active_sites": [f for f in features if f.get("type") == "Active site"],
-        "binding_sites": [f for f in features if f.get("type") == "Binding site"],
-    })
+        "total_features": total_features,
+    }
+
+    if total_features > max_features:
+        out["_truncated"] = True
+        out["_hint"] = f"全{total_features}件中{max_features}件を返しています。max_features を増やすか feature_types で絞り込んでください。"
+
+    if include_comments:
+        out["comments"] = result.get("comments", [])
+    if include_keywords:
+        out["keywords"] = result.get("keywords", [])
+
+    # 主要タイプの集計は常に含める
+    out["domains"] = [f for f in features if f.get("type") == "Domain"]
+    out["active_sites"] = [f for f in features if f.get("type") == "Active site"]
+    out["binding_sites"] = [f for f in features if f.get("type") == "Binding site"]
+
+    return _ok(out)
 
 
 @mcp.tool()
