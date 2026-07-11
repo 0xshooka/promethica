@@ -36,6 +36,8 @@ APIs = {
     "pdb": "https://data.rcsb.org/rest/v1",
     "pdb_search": "https://search.rcsb.org/rcsbsearch/v2/query",
     "go": "https://api.geneontology.org/api",
+    "opentargets": "https://api.platform.opentargets.org/api/v4/graphql",
+    "chembl": "https://www.ebi.ac.uk/chembl/api/data",
 }
 
 CLIENT_HEADERS = {
@@ -81,6 +83,18 @@ def _err(message: str, **extra: Any) -> str:
 
 def _ok(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _read_text_file(path: str, max_bytes: int = 20 * 1024 * 1024) -> str:
+    """ローカルテキストファイルを読み込む（.gz にも対応、サイズ上限あり）。同期I/Oなのでto_thread経由で呼ぶ。"""
+    import gzip
+    import os
+
+    if os.path.getsize(path) > max_bytes:
+        raise OSError(f"ファイルが大きすぎます（上限 {max_bytes // (1024 * 1024)}MB）")
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+        return f.read()
 
 
 async def make_api_request(
@@ -149,6 +163,53 @@ async def make_api_request(
 
 def _is_error(result: dict) -> bool:
     return isinstance(result, dict) and "_error" in result
+
+
+async def _graphql_request(
+    url: str, query: str, variables: Optional[dict] = None
+) -> dict[str, Any]:
+    """GraphQL POSTリクエスト。成功時はdataフィールドを、失敗時は {"_error": ...} を返す。
+
+    GraphQLはHTTP 200でもトップレベルに "errors" を返すため、それも失敗として扱う。
+    """
+    result = await make_api_request(url, json_data={"query": query, "variables": variables or {}})
+    if _is_error(result):
+        return result
+    if isinstance(result, dict) and result.get("errors"):
+        return {
+            "_error": "GraphQL error",
+            "_status": 200,
+            "_body": json.dumps(result["errors"], ensure_ascii=False)[:500],
+        }
+    if isinstance(result, dict) and "data" in result:
+        return result["data"]
+    return {"_error": "unexpected GraphQL response", "_status": None, "_body": str(result)[:500]}
+
+
+async def _resolve_ensembl_id(gene: str) -> Optional[str]:
+    """遺伝子シンボル（またはEnsembl ID）をOpen TargetsのEnsembl target IDに解決する。
+
+    既にENSG始まりならそのまま返す。見つからなければ None。
+    """
+    g = gene.strip()
+    if g.upper().startswith("ENSG"):
+        return g
+
+    query = """
+    query resolveTarget($q: String!) {
+      search(queryString: $q, entityNames: ["target"], page: {index: 0, size: 1}) {
+        hits { id entity name }
+      }
+    }
+    """
+    data = await _graphql_request(APIs["opentargets"], query, {"q": g})
+    if _is_error(data):
+        return None
+    hits = (data.get("search") or {}).get("hits") or []
+    for h in hits:
+        if h.get("entity") == "target" and h.get("id"):
+            return h["id"]
+    return None
 
 
 # ===== UniProtフィールドフィルタ =====
@@ -392,6 +453,210 @@ async def get_pdb_structure_info(pdb_id: str) -> str:
     return _ok(result)
 
 
+@mcp.tool()
+async def search_similar_structures(
+    pdb_id: str,
+    assembly_id: str = "1",
+    operator: str = "strict_shape_match",
+    size: int = 10,
+) -> str:
+    """PDB IDを起点に、構造的（3D形状）に類似する既知構造を検索（RCSB structure similarity）
+
+    Args:
+        pdb_id: 起点となるPDB ID（4文字）
+        assembly_id: アセンブリID（デフォルト: "1"）
+        operator: マッチ強度（"strict_shape_match" または "relaxed_shape_match"）
+        size: 結果数（1-100、デフォルト:10）。先頭は入力構造自身がヒットする場合がある。
+    """
+    if not pdb_id or len(pdb_id.strip()) != 4 or not pdb_id.strip().isalnum():
+        return _err("PDB IDは4文字の英数字である必要があります")
+    if operator not in ("strict_shape_match", "relaxed_shape_match"):
+        return _err(f"不正なoperator: {operator}（strict_shape_match / relaxed_shape_match）")
+    size = max(1, min(size, 100))
+
+    pid = pdb_id.strip().upper()
+    search_query = {
+        "query": {
+            "type": "terminal",
+            "service": "structure",
+            "parameters": {
+                "value": {"entry_id": pid, "assembly_id": assembly_id},
+                "operator": operator,
+            },
+        },
+        "return_type": "polymer_entity",
+        "request_options": {
+            "paginate": {"start": 0, "rows": size},
+            "results_verbosity": "minimal",
+            "sort": [{"sort_by": "score", "direction": "desc"}],
+        },
+    }
+
+    result = await make_api_request(APIs["pdb_search"], json_data=search_query)
+
+    if isinstance(result, dict) and result.get("_status") == 204:
+        return _ok({
+            "query_pdb_id": pid,
+            "operator": operator,
+            "total_count": 0,
+            "result_set": [],
+            "message": f"'{pid}' に構造的に類似する結果は見つかりませんでした",
+        })
+    if _is_error(result):
+        return _err(f"PDB ID {pdb_id} の類似構造検索に失敗しました", **result)
+
+    return _ok({
+        "query_pdb_id": pid,
+        "operator": operator,
+        "total_count": result.get("total_count", 0),
+        "result_set": result.get("result_set", [])[:size],
+        "note": "identifierは <PDB_ID>_<entity_id> 形式（polymer entity単位）。先頭は入力構造自身の可能性あり。",
+    })
+
+
+def _parse_pdb_header(text: str) -> dict[str, Any]:
+    """PDBフォーマットのヘッダ行から主要メタデータを抽出する（座標は解析しない軽量パーサ）。"""
+    info: dict[str, Any] = {
+        "pdb_id": None,
+        "classification": None,
+        "deposition_date": None,
+        "title": None,
+        "experimental_method": None,
+        "resolution": None,
+        "keywords": None,
+        "compounds": [],
+        "source_organisms": [],
+        "uniprot_accessions": [],
+    }
+    title_parts: list[str] = []
+    keyword_parts: list[str] = []
+    compnd_parts: list[str] = []
+    source_parts: list[str] = []
+
+    for raw in text.splitlines():
+        record = raw[:6].strip()
+        if record == "HEADER":
+            info["classification"] = raw[10:50].strip() or None
+            info["deposition_date"] = raw[50:59].strip() or None
+            info["pdb_id"] = raw[62:66].strip() or None
+        elif record == "TITLE":
+            title_parts.append(raw[10:].strip())
+        elif record == "KEYWDS":
+            keyword_parts.append(raw[10:].strip())
+        elif record == "EXPDTA":
+            info["experimental_method"] = (info.get("experimental_method") or "") + raw[10:].strip()
+        elif record == "COMPND":
+            compnd_parts.append(raw[10:].strip())
+        elif record == "SOURCE":
+            source_parts.append(raw[10:].strip())
+        elif record == "REMARK" and raw[7:10].strip() == "2" and "RESOLUTION" in raw:
+            # REMARK   2 RESOLUTION.    1.74 ANGSTROMS.  → "RESOLUTION." より後ろの最初の数値を採用
+            after = raw.split("RESOLUTION.", 1)[1] if "RESOLUTION." in raw else ""
+            for tok in after.split():
+                try:
+                    info["resolution"] = float(tok)
+                    break
+                except ValueError:
+                    continue
+        elif record == "DBREF" and "UNP" in raw:
+            # DBREF ... UNP  P69905 ...  (UNP = UniProt)
+            toks = raw.split()
+            try:
+                idx = toks.index("UNP")
+                acc = toks[idx + 1]
+                if acc not in info["uniprot_accessions"]:
+                    info["uniprot_accessions"].append(acc)
+            except (ValueError, IndexError):
+                pass
+
+    info["title"] = " ".join(p for p in title_parts if p) or None
+    info["keywords"] = " ".join(p for p in keyword_parts if p) or None
+
+    for part in compnd_parts:
+        if part.startswith("MOLECULE:"):
+            info["compounds"].append(part[len("MOLECULE:"):].strip().rstrip(";"))
+    for part in source_parts:
+        if part.startswith("ORGANISM_SCIENTIFIC:"):
+            info["source_organisms"].append(part[len("ORGANISM_SCIENTIFIC:"):].strip().rstrip(";"))
+
+    return info
+
+
+@mcp.tool()
+async def parse_local_pdb(file_path: str, enrich: bool = True) -> str:
+    """手元のローカル.pdbファイルからメタ情報を抽出し、関連情報を補完する（研究者D）
+
+    座標は解析せず、HEADER/TITLE/COMPND/SOURCE/EXPDTA/REMARK/DBREF などのヘッダ行から
+    分類・構造概要・実験手法・解像度・UniProt相互参照を抽出する。
+    enrich=True の場合、抽出したUniProtアクセッションから関連パスウェイ（Reactome）と
+    GO注釈（UniProt）を補完取得する。
+
+    Args:
+        file_path: ローカルの.pdbファイルパス
+        enrich: 抽出したUniProt IDから関連パスウェイ・GO注釈を補完するか（デフォルト: True）
+    """
+    if not file_path or not file_path.strip():
+        return _err("ファイルパスが必要です")
+
+    path = file_path.strip()
+    try:
+        text = await asyncio.to_thread(_read_text_file, path)
+    except FileNotFoundError:
+        return _err(f"ファイルが見つかりません: {path}")
+    except OSError as e:
+        return _err(f"ファイルの読み込みに失敗しました: {e}")
+
+    if "HEADER" not in text and "ATOM" not in text and "HETATM" not in text:
+        return _err("PDBフォーマットとして認識できませんでした（HEADER/ATOM行が見つかりません）", file_path=path)
+
+    header = _parse_pdb_header(text)
+    out: dict[str, Any] = {"file_path": path, "header": header}
+
+    if enrich and header["uniprot_accessions"]:
+        acc = header["uniprot_accessions"][0]
+        acc_enc = quote(acc, safe="")
+        pathways_result, uniprot_result = await asyncio.gather(
+            make_api_request(f"{APIs['reactome']}/mapping/UniProt/{acc_enc}/pathways"),
+            make_api_request(f"{APIs['uniprot']}/uniprotkb/{acc_enc}", {"format": "json"}),
+            return_exceptions=True,
+        )
+
+        enrichment: dict[str, Any] = {"primary_accession": acc, "pathways": None, "go_annotations": None}
+
+        if not isinstance(pathways_result, Exception) and not _is_error(pathways_result) and isinstance(pathways_result, list):
+            enrichment["pathways"] = [
+                {
+                    "stId": p.get("stId"),
+                    "name": p.get("displayName"),
+                    "species": p.get("speciesName"),
+                    "url": f"https://reactome.org/PathwayBrowser/#/{p.get('stId')}",
+                }
+                for p in pathways_result
+            ]
+
+        if not isinstance(uniprot_result, Exception) and not _is_error(uniprot_result):
+            go_terms = []
+            for ref in uniprot_result.get("uniProtKBCrossReferences", []):
+                if ref.get("database") == "GO":
+                    term = {"id": ref.get("id")}
+                    for prop in ref.get("properties", []):
+                        if prop.get("key") == "GoTerm":
+                            term["term"] = prop.get("value")
+                        elif prop.get("key") == "GoEvidenceType":
+                            term["evidence"] = prop.get("value")
+                    go_terms.append(term)
+            enrichment["go_annotations"] = go_terms
+
+        out["enrichment"] = enrichment
+    elif enrich:
+        out["enrichment"] = {
+            "note": "UniProt相互参照(DBREF)が見つからなかったため補完をスキップしました。"
+                    "HEADERのpdb_idがあれば get_pdb_structure_info で詳細取得できます。",
+        }
+
+    return _ok(out)
+
+
 # ===== Reactome関連ツール =====
 
 
@@ -578,6 +843,299 @@ async def search_go_terms(go_term: Optional[str] = None, query: Optional[str] = 
     if _is_error(result):
         return _err("Gene Ontology検索に失敗しました", **result)
     return _ok(result)
+
+
+# ===== Open Targets関連ツール（疾患関連・既知薬・副作用） =====
+
+
+@mcp.tool()
+async def get_disease_associations(gene: str, size: int = 25) -> str:
+    """遺伝子（ターゲット）に関連する疾患を取得（Open Targets, 研究者C）
+
+    Args:
+        gene: 遺伝子シンボル（例: BRCA1）またはEnsembl target ID（例: ENSG00000012048）
+        size: 結果数（1-100、デフォルト:25）。関連スコア降順。
+    """
+    if not gene or not gene.strip():
+        return _err("遺伝子名が必要です")
+    size = max(1, min(size, 100))
+
+    ensembl_id = await _resolve_ensembl_id(gene)
+    if not ensembl_id:
+        return _err(f"遺伝子 {gene} をOpen TargetsのEnsembl target IDに解決できませんでした")
+
+    query = """
+    query targetDiseases($id: String!, $size: Int!) {
+      target(ensemblId: $id) {
+        id
+        approvedSymbol
+        approvedName
+        associatedDiseases(page: {index: 0, size: $size}) {
+          count
+          rows { score disease { id name therapeuticAreas { id name } } }
+        }
+      }
+    }
+    """
+    data = await _graphql_request(APIs["opentargets"], query, {"id": ensembl_id, "size": size})
+    if _is_error(data):
+        return _err(f"遺伝子 {gene} の疾患関連情報の取得に失敗しました", **data)
+
+    target = data.get("target")
+    if not target:
+        return _err(f"Ensembl ID {ensembl_id} に対応するターゲットが見つかりませんでした")
+
+    assoc = target.get("associatedDiseases") or {}
+    return _ok({
+        "gene": gene,
+        "ensembl_id": target.get("id"),
+        "approved_symbol": target.get("approvedSymbol"),
+        "approved_name": target.get("approvedName"),
+        "total_count": assoc.get("count", 0),
+        "diseases": [
+            {
+                "efo_id": (r.get("disease") or {}).get("id"),
+                "name": (r.get("disease") or {}).get("name"),
+                "association_score": r.get("score"),
+                "therapeutic_areas": [ta.get("name") for ta in (r.get("disease") or {}).get("therapeuticAreas", [])],
+            }
+            for r in assoc.get("rows", [])
+        ],
+        "source": "Open Targets Platform",
+    })
+
+
+@mcp.tool()
+async def get_drugs_for_target(gene: str, size: int = 25) -> str:
+    """遺伝子（ターゲット）に対する既知薬・治療候補を取得（Open Targets, 研究者C）
+
+    Args:
+        gene: 遺伝子シンボル（例: EGFR）またはEnsembl target ID
+        size: 結果数（1-100、デフォルト:25）
+    """
+    if not gene or not gene.strip():
+        return _err("遺伝子名が必要です")
+    size = max(1, min(size, 100))
+
+    ensembl_id = await _resolve_ensembl_id(gene)
+    if not ensembl_id:
+        return _err(f"遺伝子 {gene} をOpen TargetsのEnsembl target IDに解決できませんでした")
+
+    query = """
+    query targetDrugs($id: String!) {
+      target(ensemblId: $id) {
+        id
+        approvedSymbol
+        drugAndClinicalCandidates {
+          count
+          rows {
+            id
+            maxClinicalStage
+            drug {
+              id
+              name
+              drugType
+              mechanismsOfAction { uniqueActionTypes rows { mechanismOfAction actionType } }
+            }
+            diseases { disease { id name } }
+          }
+        }
+      }
+    }
+    """
+    data = await _graphql_request(APIs["opentargets"], query, {"id": ensembl_id})
+    if _is_error(data):
+        return _err(f"遺伝子 {gene} の薬剤情報の取得に失敗しました", **data)
+
+    target = data.get("target")
+    if not target:
+        return _err(f"Ensembl ID {ensembl_id} に対応するターゲットが見つかりませんでした")
+
+    cand = target.get("drugAndClinicalCandidates") or {}
+    drugs = []
+    for r in cand.get("rows", [])[:size]:
+        drug = r.get("drug") or {}
+        moa = drug.get("mechanismsOfAction") or {}
+        drugs.append({
+            "chembl_id": drug.get("id"),
+            "name": drug.get("name"),
+            "drug_type": drug.get("drugType"),
+            "max_clinical_stage": r.get("maxClinicalStage"),
+            "action_types": moa.get("uniqueActionTypes") or [],
+            "mechanisms_of_action": [m.get("mechanismOfAction") for m in moa.get("rows", [])],
+            "indications": [
+                (d.get("disease") or {}).get("name")
+                for d in r.get("diseases", [])
+                if (d.get("disease") or {}).get("name")
+            ],
+        })
+
+    return _ok({
+        "gene": gene,
+        "ensembl_id": target.get("id"),
+        "approved_symbol": target.get("approvedSymbol"),
+        "total_count": cand.get("count", 0),
+        "returned": len(drugs),
+        "drugs": drugs,
+        "source": "Open Targets Platform",
+    })
+
+
+@mcp.tool()
+async def get_known_adverse_effects(drug: str, size: int = 25) -> str:
+    """既知薬の報告済み副作用（ファーマコビジランス）を検索・列挙（Open Targets/FAERS, 研究者E）
+
+    de novoな副作用「予測」ではなく、FAERS等に登録済みの既知の有害事象を検索・列挙する。
+
+    Args:
+        drug: ChEMBL ID（例: CHEMBL1201580）または薬剤名（例: aspirin）
+        size: 結果数（1-100、デフォルト:25）。有意性（logLR）降順。
+    """
+    if not drug or not drug.strip():
+        return _err("薬剤IDまたは薬剤名が必要です")
+    size = max(1, min(size, 100))
+
+    d = drug.strip()
+    chembl_id = d if d.upper().startswith("CHEMBL") else None
+
+    # 薬剤名の場合はOpen Targets searchでChEMBL IDに解決
+    if chembl_id is None:
+        resolve_q = """
+        query resolveDrug($q: String!) {
+          search(queryString: $q, entityNames: ["drug"], page: {index: 0, size: 1}) {
+            hits { id entity name }
+          }
+        }
+        """
+        rdata = await _graphql_request(APIs["opentargets"], resolve_q, {"q": d})
+        if _is_error(rdata):
+            return _err(f"薬剤 {drug} の解決に失敗しました", **rdata)
+        hits = (rdata.get("search") or {}).get("hits") or []
+        for h in hits:
+            if h.get("entity") == "drug" and h.get("id"):
+                chembl_id = h["id"]
+                break
+        if chembl_id is None:
+            return _err(f"薬剤 {drug} をChEMBL IDに解決できませんでした")
+
+    query = """
+    query drugAEs($id: String!, $size: Int!) {
+      drug(chemblId: $id) {
+        id
+        name
+        adverseEvents(page: {index: 0, size: $size}) {
+          count
+          criticalValue
+          rows { name count logLR meddraCode }
+        }
+      }
+    }
+    """
+    data = await _graphql_request(APIs["opentargets"], query, {"id": chembl_id, "size": size})
+    if _is_error(data):
+        return _err(f"薬剤 {drug} の副作用情報の取得に失敗しました", **data)
+
+    drug_obj = data.get("drug")
+    if not drug_obj:
+        return _err(f"ChEMBL ID {chembl_id} に対応する薬剤が見つかりませんでした")
+
+    aes = drug_obj.get("adverseEvents") or {}
+    return _ok({
+        "query": drug,
+        "chembl_id": drug_obj.get("id"),
+        "drug_name": drug_obj.get("name"),
+        "total_count": aes.get("count", 0),
+        "critical_value": aes.get("criticalValue"),
+        "adverse_events": [
+            {
+                "name": r.get("name"),
+                "report_count": r.get("count"),
+                "log_likelihood_ratio": r.get("logLR"),
+                "meddra_code": r.get("meddraCode"),
+            }
+            for r in aes.get("rows", [])
+        ],
+        "note": "FAERSベースの既知の有害事象報告。logLRが criticalValue を上回るものが統計的に有意。",
+        "source": "Open Targets Platform / FDA FAERS",
+    })
+
+
+# ===== ChEMBL関連ツール（化合物の化学的詳細） =====
+
+
+@mcp.tool()
+async def get_drug_details(chembl_id: str) -> str:
+    """ChEMBL IDから薬剤・化合物の化学的詳細（構造・作用機序・適応）を取得（ChEMBL）
+
+    Args:
+        chembl_id: ChEMBL molecule ID（例: CHEMBL25）
+    """
+    if not chembl_id or not chembl_id.strip():
+        return _err("ChEMBL IDが必要です")
+    cid = chembl_id.strip().upper()
+    if not cid.startswith("CHEMBL"):
+        return _err("ChEMBL IDは 'CHEMBL' で始まる必要があります")
+
+    cid_enc = quote(cid, safe="")
+    molecule, mechanisms, indications = await asyncio.gather(
+        make_api_request(f"{APIs['chembl']}/molecule/{cid_enc}.json"),
+        make_api_request(f"{APIs['chembl']}/mechanism.json", {"molecule_chembl_id": cid}),
+        make_api_request(f"{APIs['chembl']}/drug_indication.json", {"molecule_chembl_id": cid}),
+        return_exceptions=True,
+    )
+
+    if isinstance(molecule, Exception) or _is_error(molecule):
+        return _err(f"ChEMBL ID {chembl_id} の情報取得に失敗しました",
+                    **(molecule if isinstance(molecule, dict) else {"_error": str(molecule)}))
+
+    props = molecule.get("molecule_properties") or {}
+    structs = molecule.get("molecule_structures") or {}
+    out: dict[str, Any] = {
+        "chembl_id": molecule.get("molecule_chembl_id"),
+        "name": molecule.get("pref_name"),
+        "molecule_type": molecule.get("molecule_type"),
+        "max_phase": molecule.get("max_phase"),
+        "first_approval": molecule.get("first_approval"),
+        "oral": molecule.get("oral"),
+        "parenteral": molecule.get("parenteral"),
+        "properties": {
+            "full_mwt": props.get("full_mwt"),
+            "alogp": props.get("alogp"),
+            "hba": props.get("hba"),
+            "hbd": props.get("hbd"),
+            "psa": props.get("psa"),
+            "ro5_violations": props.get("num_ro5_violations"),
+        },
+        "canonical_smiles": structs.get("canonical_smiles"),
+        "mechanisms": [],
+        "indications": [],
+    }
+
+    if not isinstance(mechanisms, Exception) and not _is_error(mechanisms):
+        out["mechanisms"] = [
+            {
+                "mechanism_of_action": m.get("mechanism_of_action"),
+                "action_type": m.get("action_type"),
+                "target_chembl_id": m.get("target_chembl_id"),
+            }
+            for m in mechanisms.get("mechanisms", [])
+        ]
+
+    if not isinstance(indications, Exception) and not _is_error(indications):
+        seen: set[str] = set()
+        for ind in indications.get("drug_indications", []):
+            name = ind.get("efo_term") or ind.get("mesh_heading")
+            key = f"{name}|{ind.get('max_phase_for_ind')}"
+            if name and key not in seen:
+                seen.add(key)
+                out["indications"].append({
+                    "indication": name,
+                    "max_phase": ind.get("max_phase_for_ind"),
+                    "efo_id": ind.get("efo_id"),
+                })
+
+    out["source"] = "ChEMBL"
+    return _ok(out)
 
 
 # ===== 統合分析ツール =====
