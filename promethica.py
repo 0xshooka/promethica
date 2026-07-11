@@ -1138,6 +1138,275 @@ async def get_drug_details(chembl_id: str) -> str:
     return _ok(out)
 
 
+# ===== パスウェイグラフ・gap検出ツール（Phase 2） =====
+
+# ReactionLikeEvent と見なすschemaClass以外（＝Pathway階層）はグラフ構築時にスキップする
+_PATHWAY_SCHEMA_CLASSES = {"Pathway", "TopLevelPathway"}
+
+
+class _UnionFind:
+    """連結成分検出用の軽量Union-Find（新規依存を避けるため自前実装）。"""
+
+    def __init__(self) -> None:
+        self._parent: dict[str, str] = {}
+
+    def add(self, x: str) -> None:
+        self._parent.setdefault(x, x)
+
+    def find(self, x: str) -> str:
+        self.add(x)
+        root = x
+        while self._parent[root] != root:
+            root = self._parent[root]
+        # 経路圧縮
+        while self._parent[x] != root:
+            self._parent[x], x = root, self._parent[x]
+        return root
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._parent[ra] = rb
+
+    def components(self) -> list[list[str]]:
+        groups: dict[str, list[str]] = {}
+        for node in self._parent:
+            groups.setdefault(self.find(node), []).append(node)
+        return sorted(groups.values(), key=len, reverse=True)
+
+
+async def _build_pathway_graph_data(pathway_id: str, max_reactions: int) -> dict[str, Any]:
+    """パスウェイの反応から二部グラフ（エンティティ⇄反応）を構築する。
+
+    戻り値: {"nodes": {...}, "edges": [...], "reactions": [...], "_meta": {...}}
+    もしくは失敗時 {"_error": ...}。
+    ノードは stId をキーとする dict。エッジは input(entity→reaction) / output(reaction→entity)。
+    """
+    pid = pathway_id.strip()
+    events = await make_api_request(f"{APIs['reactome']}/pathway/{quote(pid, safe='')}/containedEvents")
+    if _is_error(events):
+        return events
+    if not isinstance(events, list):
+        return {"_error": "containedEventsが配列ではありません", "_status": None, "_body": str(events)[:300]}
+
+    # containedEvents は dict と bare int(dbId参照) が混在するため dict のみ対象にする
+    reactions = [
+        e for e in events
+        if isinstance(e, dict) and e.get("stId") and e.get("schemaClass") not in _PATHWAY_SCHEMA_CLASSES
+    ]
+    total_reactions = len(reactions)
+    truncated = total_reactions > max_reactions
+    reactions = reactions[:max_reactions]
+
+    if not reactions:
+        return {
+            "_error": "このパスウェイに反応（ReactionLikeEvent）が見つかりませんでした",
+            "_status": None,
+            "pathway_id": pid,
+        }
+
+    details = await asyncio.gather(
+        *[make_api_request(f"{APIs['reactome']}/query/{quote(r['stId'], safe='')}") for r in reactions],
+        return_exceptions=True,
+    )
+
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, str]] = []
+    processed: list[dict[str, Any]] = []
+
+    def _add_node(entity: Any, node_type: str) -> Optional[str]:
+        if not isinstance(entity, dict):
+            return None
+        sid = entity.get("stId")
+        if not sid:
+            return None
+        if sid not in nodes:
+            nodes[sid] = {
+                "id": sid,
+                "label": entity.get("displayName") or entity.get("name") or sid,
+                "type": node_type,
+                "schema_class": entity.get("schemaClass"),
+            }
+        return sid
+
+    for rxn, detail in zip(reactions, details):
+        if isinstance(detail, Exception) or _is_error(detail):
+            continue
+        rid = _add_node(detail, "reaction")
+        if rid is None:
+            continue
+        inputs = [i for i in (_add_node(e, "entity") for e in detail.get("input", []) or []) if i]
+        outputs = [o for o in (_add_node(e, "entity") for e in detail.get("output", []) or []) if o]
+        for i in inputs:
+            edges.append({"id": f"{i}->{rid}", "source": i, "target": rid, "role": "input"})
+        for o in outputs:
+            edges.append({"id": f"{rid}->{o}", "source": rid, "target": o, "role": "output"})
+        processed.append({"stId": rid, "name": nodes[rid]["label"], "inputs": inputs, "outputs": outputs})
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "reactions": processed,
+        "_meta": {
+            "pathway_id": pid,
+            "total_reactions_in_pathway": total_reactions,
+            "reactions_processed": len(processed),
+            "truncated": truncated,
+            "max_reactions": max_reactions,
+        },
+    }
+
+
+@mcp.tool()
+async def build_pathway_graph(
+    pathway_id: str,
+    max_reactions: int = 40,
+    as_cytoscape: bool = False,
+) -> str:
+    """Reactomeパスウェイを反応ネットワーク（エンティティ⇄反応の二部グラフ）として構築（Phase 2）
+
+    各反応の input（基質）→反応→output（生成物）を有向エッジとして表現する。
+
+    Args:
+        pathway_id: Reactome stable ID（例: R-HSA-70171 = Glycolysis）
+        max_reactions: 処理する反応の最大数（デフォルト:40、APIコール数の上限）
+        as_cytoscape: TrueならCytoscape.js形式（elements）で返す（可視化用）
+    """
+    if not pathway_id or not pathway_id.strip():
+        return _err("パスウェイIDが必要です")
+    max_reactions = max(1, min(max_reactions, 200))
+
+    graph = await _build_pathway_graph_data(pathway_id, max_reactions)
+    if _is_error(graph):
+        return _err("パスウェイグラフの構築に失敗しました", **graph)
+
+    meta = graph["_meta"]
+    if as_cytoscape:
+        elements = {
+            "nodes": [{"data": n} for n in graph["nodes"].values()],
+            "edges": [{"data": e} for e in graph["edges"]],
+        }
+        return _ok({"format": "cytoscape", "elements": elements, "_meta": meta})
+
+    return _ok({
+        "pathway_id": meta["pathway_id"],
+        "node_count": len(graph["nodes"]),
+        "edge_count": len(graph["edges"]),
+        "nodes": list(graph["nodes"].values()),
+        "edges": graph["edges"],
+        "_meta": meta,
+        "hint": "可視化用にはas_cytoscape=Trueを指定。gap検出はdetect_pathway_gapsを使用。",
+    })
+
+
+@mcp.tool()
+async def detect_pathway_gaps(pathway_id: str, max_reactions: int = 40) -> str:
+    """パスウェイ反応ネットワーク上の未接続部分（gap）を検出（Phase 2）
+
+    グラフを弱連結成分に分解し、複数成分に分かれている場合はそれらを「未接続領域（gap候補）」
+    として報告する。あわせて、境界エンティティ（どの反応でも生成されない入力＝供給境界／
+    どの反応でも消費されない出力＝末端）を列挙する。将来的にはネットワーク図として図示する。
+
+    Args:
+        pathway_id: Reactome stable ID（例: R-HSA-70171）
+        max_reactions: 処理する反応の最大数（デフォルト:40）
+    """
+    if not pathway_id or not pathway_id.strip():
+        return _err("パスウェイIDが必要です")
+    max_reactions = max(1, min(max_reactions, 200))
+
+    graph = await _build_pathway_graph_data(pathway_id, max_reactions)
+    if _is_error(graph):
+        return _err("パスウェイのgap検出に失敗しました", **graph)
+
+    nodes = graph["nodes"]
+    edges = graph["edges"]
+
+    # 弱連結成分（エッジを無向とみなす）
+    uf = _UnionFind()
+    for n in nodes:
+        uf.add(n)
+    for e in edges:
+        uf.union(e["source"], e["target"])
+
+    components = uf.components()
+    component_summaries = [
+        {
+            "size": len(comp),
+            "reactions": sum(1 for n in comp if nodes[n]["type"] == "reaction"),
+            "entities": sum(1 for n in comp if nodes[n]["type"] == "entity"),
+            "sample_labels": [nodes[n]["label"] for n in comp if nodes[n]["type"] == "entity"][:5],
+        }
+        for comp in components
+    ]
+
+    # 境界エンティティ: 入力にのみ現れる（生成されない）／出力にのみ現れる（消費されない）
+    consumed: set[str] = set()  # 反応のinputになっている（消費される）
+    produced: set[str] = set()  # 反応のoutputになっている（生成される）
+    for e in edges:
+        if e["role"] == "input":
+            consumed.add(e["source"])
+        elif e["role"] == "output":
+            produced.add(e["target"])
+
+    boundary_inputs = [
+        {"id": n, "label": nodes[n]["label"]}
+        for n in nodes
+        if nodes[n]["type"] == "entity" and n in consumed and n not in produced
+    ]
+    boundary_outputs = [
+        {"id": n, "label": nodes[n]["label"]}
+        for n in nodes
+        if nodes[n]["type"] == "entity" and n in produced and n not in consumed
+    ]
+
+    num_components = len(components)
+    if num_components <= 1:
+        interpretation = "単一の連結成分。反応ネットワーク上に明示的な分断（gap）は検出されませんでした。"
+    else:
+        interpretation = (
+            f"{num_components}個の未接続成分に分断されています。これらの成分間には既知データ上の"
+            f"つながりが無く、gap候補（本来つながるべき反応・中間体が未記載の可能性）です。"
+        )
+
+    return _ok({
+        "pathway_id": graph["_meta"]["pathway_id"],
+        "num_components": num_components,
+        "components": component_summaries,
+        "boundary_inputs": boundary_inputs[:20],
+        "boundary_outputs": boundary_outputs[:20],
+        "boundary_inputs_count": len(boundary_inputs),
+        "boundary_outputs_count": len(boundary_outputs),
+        "interpretation": interpretation,
+        "_meta": graph["_meta"],
+        "note": "boundary_inputs は外部供給される基質、boundary_outputs は末端生成物。"
+                "分断が反応数上限による見かけ上のものでないか _meta.truncated を確認してください。",
+    })
+
+
+@mcp.tool()
+async def export_pathway_cytoscape(pathway_id: str, max_reactions: int = 40) -> str:
+    """パスウェイ反応ネットワークをCytoscape.js形式（elements）でエクスポート（Phase 2, 可視化用）
+
+    Args:
+        pathway_id: Reactome stable ID（例: R-HSA-70171）
+        max_reactions: 処理する反応の最大数（デフォルト:40）
+    """
+    if not pathway_id or not pathway_id.strip():
+        return _err("パスウェイIDが必要です")
+    max_reactions = max(1, min(max_reactions, 200))
+
+    graph = await _build_pathway_graph_data(pathway_id, max_reactions)
+    if _is_error(graph):
+        return _err("Cytoscapeエクスポートに失敗しました", **graph)
+
+    elements = {
+        "nodes": [{"data": n} for n in graph["nodes"].values()],
+        "edges": [{"data": e} for e in graph["edges"]],
+    }
+    return _ok({"format": "cytoscape", "elements": elements, "_meta": graph["_meta"]})
+
+
 # ===== 統合分析ツール =====
 
 

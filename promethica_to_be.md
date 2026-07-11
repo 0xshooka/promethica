@@ -148,18 +148,23 @@ TO-BE実現に向けた段階的な開発計画。各フェーズは前フェー
 
 ---
 
-### Phase 2: パスウェイのグラフ化とgap検出
+### Phase 2: パスウェイのグラフ化とgap検出 ✅ **実装済み**
 
 **目的**: 「未接続部分の検出」機能の実現（図示は将来対応）。
 
-- Reactome/相互作用データからパスウェイを**グラフ構造（ノード＝分子、エッジ＝反応/相互作用）として構築**するモジュールを追加。
-- **未接続（gap）検出ロジック**: 期待される連結が欠けている箇所をグラフアルゴリズムで抽出（例: 到達不能ノード、分断コンポーネント間の隙間）。
-- **Cytoscape形式（JSON）での入出力**に対応し、外部可視化ツールへ受け渡せるようにする。
+| 実装ツール | 内容 |
+| --- | --- |
+| `build_pathway_graph(pathway_id, max_reactions, as_cytoscape)` | Reactomeの反応から**エンティティ⇄反応の二部グラフ**を構築（input→反応→outputの有向エッジ） |
+| `detect_pathway_gaps(pathway_id, max_reactions)` | グラフを**弱連結成分**に分解し、複数成分に分かれる箇所を**gap候補**として報告。境界エンティティ（供給境界／末端）も列挙 |
+| `export_pathway_cytoscape(pathway_id, max_reactions)` | **Cytoscape.js形式（elements）でエクスポート**し、外部可視化ツールへ受け渡し可能に |
+
+**実装メモ**:
+- グラフはReactome `/pathway/{id}/containedEvents`（反応一覧）＋各反応の `/query/{id}`（input/output）から構築。containedEventsやinput/outputは**dictとbare int(dbId参照)が混在**するため、dict要素のみを対象にするガードを実装。
+- 連結成分の検出は**新規依存を避けて自前のUnion-Find**（`_UnionFind`）で実装。networkx等は導入しない。
+- 反応ごとに1 APIコールのため `max_reactions` で上限を設け（デフォルト40）、`asyncio.gather` で並列取得。分断が反応数上限による見かけ上のものでないか `_meta.truncated` で判別可能。
 - 図示自体はこのフェーズでは範囲外（Cytoscape側 or 将来のPhase 4フロントで対応）。
 
-**新規ツール（案）**: `build_pathway_graph(pathway_id)` / `detect_pathway_gaps(graph)` / `export_cytoscape(graph)`
-
-**完了条件**: 任意パスウェイのグラフを取得し、未接続領域をリスト化して返せる。
+**完了条件**: 任意パスウェイのグラフを取得し、未接続領域をリスト化して返せる → **達成**（Glycolysis等で実API動作確認済み）。
 
 ---
 
