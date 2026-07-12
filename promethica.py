@@ -48,6 +48,10 @@ CLIENT_HEADERS = {
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 MAX_RETRIES = 3
 
+# 一過性の可能性が高いステータス（レート制限＋ゲートウェイ/サーバ系5xx）はリトライする。
+# 520/522/524 はCloudflare由来の一過性エラー（Reactomeで頻発）。
+RETRIABLE_STATUS = {429, 500, 502, 503, 504, 520, 522, 524}
+
 # Module-level client with connection pooling. Lazily created to avoid loop issues.
 _client: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
@@ -132,10 +136,10 @@ async def make_api_request(
             else:
                 response = await client.get(url, params=params, headers=extra_headers)
 
-            if response.status_code in (429, 503):
+            if response.status_code in RETRIABLE_STATUS:
                 retry_after = response.headers.get("Retry-After")
                 delay = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt + random.random()
-                logger.warning("rate-limited %s (status=%s, attempt=%s, sleep=%.1fs)", url, response.status_code, attempt + 1, delay)
+                logger.warning("retriable status %s %s (attempt=%s, sleep=%.1fs)", response.status_code, url, attempt + 1, delay)
                 last_err = {"_error": f"HTTP {response.status_code}", "_status": response.status_code}
                 await asyncio.sleep(delay)
                 continue
@@ -1257,6 +1261,46 @@ async def _build_pathway_graph_data(pathway_id: str, max_reactions: int) -> dict
     }
 
 
+def _compute_pathway_gaps(graph: dict[str, Any]) -> dict[str, Any]:
+    """グラフデータから弱連結成分・境界エンティティを算出する（detect/proposeで共用）。"""
+    nodes = graph["nodes"]
+    edges = graph["edges"]
+
+    uf = _UnionFind()
+    for n in nodes:
+        uf.add(n)
+    for e in edges:
+        uf.union(e["source"], e["target"])
+    components = uf.components()
+    comp_index = {n: idx for idx, comp in enumerate(components) for n in comp}
+
+    consumed: set[str] = set()  # 反応のinputになっている（消費される）
+    produced: set[str] = set()  # 反応のoutputになっている（生成される）
+    for e in edges:
+        if e["role"] == "input":
+            consumed.add(e["source"])
+        elif e["role"] == "output":
+            produced.add(e["target"])
+
+    boundary_inputs = [
+        n for n in nodes
+        if nodes[n]["type"] == "entity" and n in consumed and n not in produced
+    ]
+    boundary_outputs = [
+        n for n in nodes
+        if nodes[n]["type"] == "entity" and n in produced and n not in consumed
+    ]
+
+    return {
+        "components": components,
+        "comp_index": comp_index,
+        "consumed": consumed,
+        "produced": produced,
+        "boundary_inputs": boundary_inputs,
+        "boundary_outputs": boundary_outputs,
+    }
+
+
 @mcp.tool()
 async def build_pathway_graph(
     pathway_id: str,
@@ -1320,16 +1364,9 @@ async def detect_pathway_gaps(pathway_id: str, max_reactions: int = 40) -> str:
         return _err("パスウェイのgap検出に失敗しました", **graph)
 
     nodes = graph["nodes"]
-    edges = graph["edges"]
+    gaps = _compute_pathway_gaps(graph)
+    components = gaps["components"]
 
-    # 弱連結成分（エッジを無向とみなす）
-    uf = _UnionFind()
-    for n in nodes:
-        uf.add(n)
-    for e in edges:
-        uf.union(e["source"], e["target"])
-
-    components = uf.components()
     component_summaries = [
         {
             "size": len(comp),
@@ -1340,25 +1377,8 @@ async def detect_pathway_gaps(pathway_id: str, max_reactions: int = 40) -> str:
         for comp in components
     ]
 
-    # 境界エンティティ: 入力にのみ現れる（生成されない）／出力にのみ現れる（消費されない）
-    consumed: set[str] = set()  # 反応のinputになっている（消費される）
-    produced: set[str] = set()  # 反応のoutputになっている（生成される）
-    for e in edges:
-        if e["role"] == "input":
-            consumed.add(e["source"])
-        elif e["role"] == "output":
-            produced.add(e["target"])
-
-    boundary_inputs = [
-        {"id": n, "label": nodes[n]["label"]}
-        for n in nodes
-        if nodes[n]["type"] == "entity" and n in consumed and n not in produced
-    ]
-    boundary_outputs = [
-        {"id": n, "label": nodes[n]["label"]}
-        for n in nodes
-        if nodes[n]["type"] == "entity" and n in produced and n not in consumed
-    ]
+    boundary_inputs = [{"id": n, "label": nodes[n]["label"]} for n in gaps["boundary_inputs"]]
+    boundary_outputs = [{"id": n, "label": nodes[n]["label"]} for n in gaps["boundary_outputs"]]
 
     num_components = len(components)
     if num_components <= 1:
@@ -1405,6 +1425,163 @@ async def export_pathway_cytoscape(pathway_id: str, max_reactions: int = 40) -> 
         "edges": [{"data": e} for e in graph["edges"]],
     }
     return _ok({"format": "cytoscape", "elements": elements, "_meta": graph["_meta"]})
+
+
+# ===== ノード候補提示ツール（Phase 3, 仮説生成） =====
+
+
+def _event_summary(ev: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(ev, dict) or not ev.get("stId"):
+        return None
+    return {"stId": ev.get("stId"), "name": ev.get("displayName"), "schema_class": ev.get("schemaClass")}
+
+
+def _reference_summary(entity_detail: dict) -> Optional[dict[str, Any]]:
+    """エンティティのreferenceEntity（ChEBI/UniProt等）から識別子コンテキストを抽出。"""
+    ref = entity_detail.get("referenceEntity")
+    if not isinstance(ref, dict):
+        return None
+    name = ref.get("name")
+    if isinstance(name, list):
+        name = name[0] if name else None
+    return {
+        "identifier": ref.get("identifier"),
+        "database": ref.get("databaseName"),
+        "name": name,
+    }
+
+
+@mcp.tool()
+async def propose_gap_node_candidates(
+    pathway_id: str,
+    max_reactions: int = 40,
+    max_boundary_entities: int = 12,
+    max_candidates_per_boundary: int = 8,
+) -> str:
+    """パスウェイのgap（未接続部分）を埋めうる「ノード候補」を仮説として提示（Phase 3）
+
+    既知の反応データベース(Reactome)に基づき、gap境界の代謝物を「他の反応で消費/生成している
+    反応」を辿って、そこに存在しうる中間ノードの候補を列挙する。特に、ある成分の境界出力を消費し
+    別の成分の境界入力を生成する反応は、2成分を直接つなぐ「ブリッジ候補」として提示する。
+
+    重要: 本ツールは**既知反応に基づく候補・仮説の提示のみ**を行い、実在性の断定や新規配列の生成は
+    一切行わない。候補には必ず根拠（どの境界エンティティ・どの方向から導いたか）を併記する。
+
+    Args:
+        pathway_id: Reactome stable ID（例: R-HSA-70171）
+        max_reactions: グラフ構築時に処理する反応の最大数（デフォルト:40）
+        max_boundary_entities: 候補探索する境界エンティティの上限（入力/出力それぞれ、デフォルト:12）
+        max_candidates_per_boundary: 境界エンティティ1つあたりの候補反応の上限（デフォルト:8）
+    """
+    if not pathway_id or not pathway_id.strip():
+        return _err("パスウェイIDが必要です")
+    max_reactions = max(1, min(max_reactions, 200))
+    max_boundary_entities = max(1, min(max_boundary_entities, 40))
+    max_candidates_per_boundary = max(1, min(max_candidates_per_boundary, 25))
+
+    graph = await _build_pathway_graph_data(pathway_id, max_reactions)
+    if _is_error(graph):
+        return _err("ノード候補提示に失敗しました", **graph)
+
+    nodes = graph["nodes"]
+    gaps = _compute_pathway_gaps(graph)
+    comp_index = gaps["comp_index"]
+    own_reactions = {r["stId"] for r in graph["reactions"]}  # パスウェイ自身の反応（候補から除外）
+
+    b_outputs = gaps["boundary_outputs"][:max_boundary_entities]
+    b_inputs = gaps["boundary_inputs"][:max_boundary_entities]
+
+    # 境界エンティティの詳細を並列取得（consumedByEvent / producedByEvent / referenceEntity）
+    target_ids = b_outputs + b_inputs
+    details = await asyncio.gather(
+        *[make_api_request(f"{APIs['reactome']}/query/{quote(eid, safe='')}") for eid in target_ids],
+        return_exceptions=True,
+    )
+    detail_map = {
+        eid: d for eid, d in zip(target_ids, details)
+        if not isinstance(d, Exception) and not _is_error(d) and isinstance(d, dict)
+    }
+
+    boundary_analysis: list[dict[str, Any]] = []
+    consumer_map: dict[str, list[dict]] = {}  # 反応stId -> [{entity, component}] (境界出力を消費する反応)
+    producer_map: dict[str, list[dict]] = {}  # 反応stId -> [{entity, component}] (境界入力を生成する反応)
+    event_names: dict[str, str] = {}  # 候補反応stId -> displayName（グラフ外の反応名を保持）
+
+    def _candidate_events(detail: dict, key: str) -> list[dict]:
+        out = []
+        for ev in detail.get(key, []) or []:
+            s = _event_summary(ev)
+            if s and s["stId"] not in own_reactions:
+                out.append(s)
+        return out[:max_candidates_per_boundary]
+
+    for eid in b_outputs:
+        detail = detail_map.get(eid)
+        if not detail:
+            continue
+        cands = _candidate_events(detail, "consumedByEvent")
+        boundary_analysis.append({
+            "entity": {"id": eid, "label": nodes[eid]["label"]},
+            "role": "boundary_output",
+            "component": comp_index.get(eid),
+            "reference": _reference_summary(detail),
+            "direction": "この代謝物を消費する既知反応（＝下流に置きうる候補ノード）",
+            "candidate_reactions": cands,
+        })
+        for c in cands:
+            consumer_map.setdefault(c["stId"], []).append({"entity": eid, "component": comp_index.get(eid)})
+            event_names[c["stId"]] = c["name"]
+
+    for eid in b_inputs:
+        detail = detail_map.get(eid)
+        if not detail:
+            continue
+        cands = _candidate_events(detail, "producedByEvent")
+        boundary_analysis.append({
+            "entity": {"id": eid, "label": nodes[eid]["label"]},
+            "role": "boundary_input",
+            "component": comp_index.get(eid),
+            "reference": _reference_summary(detail),
+            "direction": "この代謝物を生成する既知反応（＝上流に置きうる候補ノード）",
+            "candidate_reactions": cands,
+        })
+        for c in cands:
+            producer_map.setdefault(c["stId"], []).append({"entity": eid, "component": comp_index.get(eid)})
+            event_names[c["stId"]] = c["name"]
+
+    # ブリッジ候補: ある成分の境界出力を消費し、別成分の境界入力を生成する同一反応
+    bridge_candidates: list[dict[str, Any]] = []
+    for rid in set(consumer_map) & set(producer_map):
+        for src in consumer_map[rid]:
+            for dst in producer_map[rid]:
+                if src["component"] != dst["component"]:
+                    label = nodes[rid]["label"] if rid in nodes else event_names.get(rid, rid)
+                    bridge_candidates.append({
+                        "candidate_reaction": {"stId": rid, "name": label},
+                        "connects_components": [src["component"], dst["component"]],
+                        "rationale": (
+                            f"成分{src['component']}の境界出力『{nodes[src['entity']]['label']}』を消費し、"
+                            f"成分{dst['component']}の境界入力『{nodes[dst['entity']]['label']}』を生成する既知反応。"
+                            f"両成分を直接つなぐ中間ノードの候補。"
+                        ),
+                    })
+
+    num_components = len(gaps["components"])
+    return _ok({
+        "pathway_id": graph["_meta"]["pathway_id"],
+        "gap_present": num_components > 1,
+        "num_components": num_components,
+        "bridge_candidates": bridge_candidates,
+        "boundary_analysis": boundary_analysis,
+        "_meta": graph["_meta"],
+        "disclaimer": (
+            "これらは既知反応データベース(Reactome)に基づく候補・仮説であり、gapの実在性や"
+            "候補ノードの妥当性を断定するものではありません。新規タンパク質配列の生成は行っていません。"
+            "候補は必ず実験・文献で検証してください。"
+        ),
+        "hint": "bridge_candidates が2成分を直接つなぐ最有力の候補。boundary_analysis は各境界からの"
+                "拡張候補で、gapが無い場合でもパスウェイ拡張のヒントになります。",
+    })
 
 
 # ===== 統合分析ツール =====
