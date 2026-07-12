@@ -219,3 +219,38 @@ Phase 1〜3 ──> Phase 4 (Slack/可視化/商用化) ──> Phase 5 (AFaaS�
 ```
 
 Phase 1とPhase 2は独立して着手可能。Phase 3はPhase 2に、Phase 4は主要機能（1〜3）の成熟に依存する。
+
+---
+
+## 申し送り事項（ハンドオフ）
+
+このセクションはセッション間の引き継ぎ用メモ。実装状況・未決事項・次の一手を集約する。
+
+### 現在の到達点（2026-07時点）
+
+- **Phase 0〜3 実装済み**（合計22ツール）。ユースケースA〜E＋反応ネットワークのgap検出・ノード候補提示まで動作。
+- **Reactome → Rhea + UniProt へ全面移行済み**（上記「データソース方針」参照）。コード中のReactome APIコールは完全に除去。
+- 全ツールを実API（UniProt / Rhea / PDB / GO / Open Targets / ChEMBL）に対するスモークテストで確認済み。
+
+### ブランチ／PR状況
+
+- 作業はフェーズごとのスタックブランチ: `feat/phase1-disease-drug-structure` → `feat/phase2-pathway-graph-gaps` → `feat/phase3-gap-node-candidates`。
+- Rhea+UniProtリファクタは `feat/phase3-...` ブランチ上のコミット `eb668c8`。
+- **push / PR作成はリポジトリ所有者が手動で実施**（この環境からは `gh` 未導入・SSH pushが publickey で不可）。**いずれのPRもmainには未マージ**。マージ順序に注意（phase1→2→3の順、またはmainへまとめてスカッシュ）。
+- コミットのauthorは自動推定の `shooka@Gungnir.local`（`git config` の user.name/email 未設定）。必要なら設定を。
+
+### 既知の制約・技術メモ（重要）
+
+- **Rhea反応は双方向**。方向性はRheaの反応式の左右を便宜的に基質/生成物として扱っているだけで、生体内の実際の流れとは限らない。gapブリッジ判定は方向非依存にしてある。
+- **通貨代謝物**（H2O/ATP/NAD(+)等、`_CURRENCY_CHEBI`）を既定で除外。除外セットは主要なもののみで**網羅的ではない**。ネットワークが過剰に分断/結合する場合はこのセットの調整が要点。
+- 単一の多機能酵素は無関係な複数反応を持ちうる（例: GAPDHは解糖反応＋S-ニトロシル化反応）。この場合、単一酵素入力でも複数成分に分かれるのは**正常**（gapの誤検出ではない）。
+- グラフ系ツールの入力は**UniProtアクセッションの集合**（旧: Reactomeパスウェイ ID）。「反応でつなぎたい酵素群」を渡す設計。
+- 外部APIは一過性5xx（520/522/524等）を含めリトライ実装済み。ただし長時間の全面障害には無力——商用化時はデータダンプ取り込み/自前ホストを検討（下記）。
+
+### 未決事項・次の一手の候補
+
+- **自動テスト未整備**: リファクタでツール名・入力仕様が変わったため、Rhea+UniProt版の回帰テストが無い。まず整備推奨。
+- **小改善**: `propose_gap_node_candidates` の候補酵素にEC番号を付与／`build_reaction_network` に遺伝子シンボル入力を許可（内部で `search_by_gene` 経由でaccession解決）／`_CURRENCY_CHEBI` の拡充。
+- **Phase 4**（Slack連携・可視化・商用MCPホスティング）への着手。
+- **運用信頼性の本命**: 商用化フェーズでは公開ライブAPI依存を減らし、Rhea/UniProt/ChEBIのデータダンプ取り込み or 自前ホストを検討（Reactome障害の教訓）。
+- 検討だけして**不採用**にした選択肢: Pathway Commonsフォールバック（ライセンス混在のため不採用で確定）、KEGG（商用有償のため不採用）。
