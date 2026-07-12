@@ -18,7 +18,7 @@ Promethicaは、バイオインフォマティクス領域における**デー�
 
 ### MCPベースのAPI統合
 
-- UniProt / PDB / Reactome / GOなどの生体分子DBに対応
+- UniProt / PDB / Rhea / GO / ChEMBL / Open Targetsなどの生体分子DBに対応（いずれもライセンスが明快な公開API）
 - ユーザーの1入力で複数の関数をカスケード的に呼び出し、より自然で柔軟かつ正確な質問が可能
 
 ### パスウェイ補完・逆引き機能
@@ -38,8 +38,8 @@ Promethicaは、バイオインフォマティクス領域における**デー�
 
 | 機能領域 | 内容 |
 | --- | --- |
-| データ統合 | 複数DB（UniProt／PDB／Reactome／GO／ChEMBL／Open Targets）のAPI連携／Cytoscape形式入出力／オントロジー統合 |
-| パスウェイ補完 | グラフ上の未接続（gap）検出（将来的に図示）／gap近傍情報からのノード候補提示／GO term・モチーフ・相互作用に基づく仮説提示 |
+| データ統合 | 複数DB（UniProt／PDB／Rhea／GO／ChEMBL／Open Targets）のAPI連携／Cytoscape形式入出力／オントロジー統合 |
+| 反応ネットワーク補完 | 酵素集合の触媒反応(Rhea)からグラフ構築／グラフ上の未接続（gap）検出（将来的に図示）／gap境界からのノード候補（反応・酵素）提示 |
 | 副作用・作用機序の検索 | 既知物質（既知薬・代謝物）→関連ターゲット・作用パスウェイの検索／既知の副作用・関連代謝系の列挙（ChEMBL／Open Targets連携） |
 | チャット連携 | Slackなどから自然言語によるコマンド／結果ビジュアライズ |
 
@@ -72,7 +72,7 @@ Promethicaは、バイオインフォマティクス領域における**デー�
 ### 研究者A「この新規タンパク質、何者？」
 
 - 入力：UniProt ID
-- 出力：名前・機能・関連GO・関与するReactomeパスウェイ
+- 出力：名前・機能・関連GO・触媒するRhea反応
 
 ### 研究者B「この構造と似てるやつ他にある？」
 
@@ -110,15 +110,17 @@ Promethicaは、バイオインフォマティクス領域における**デー�
 
 TO-BE実現に向けた段階的な開発計画。各フェーズは前フェーズの成果物の上に積み上がる構成とし、フェーズ完了ごとに単体で価値を提供できる状態を目指す。
 
+> **データソース方針（重要）**: 反応・経路情報のソースを **Reactome から Rhea + UniProt に全面移行**した。理由は2点。(1) 運用信頼性——Reactomeの公開ライブAPIが長時間の全面障害を起こし、商用MCPの基盤として依存し続けるのは危険と判断。RheaもUniProtもEBI基盤で信頼性が高い。(2) **ライセンスの純度**——Promethicaが仮に無償でも、その出力を用いた成果物が商用利用される可能性を踏まえ、ライセンス混在（KEGG=商用有償、Pathway Commons=出典混在）を避け、**Rhea・UniProt・ChEBIともにCC-BY 4.0で統一**した。KEGG/Pathway Commonsは採用しない。反応の単位は「Reactomeパスウェイ」から「酵素→Rhea反応→ChEBI代謝物ネットワーク」に変わり、グラフ系ツールの入力もパスウェイIDから**UniProtアクセッションの集合**に変更した。
+
 ### 現在地（MVP / Phase 0）
 
 すでに実装済みの基盤。単一のMCPサーバー（`promethica.py`, FastMCP/stdio）上で以下のツールが稼働。
 
 - **UniProt**: `search_proteins` / `get_protein_info` / `get_protein_sequence` / `search_by_gene` / `get_primary_protein_for_gene` / `get_protein_features`
 - **PDB**: `search_pdb_structures` / `get_pdb_structure_info`
-- **Reactome**: `search_pathways` / `get_protein_pathways`
+- **Rhea + UniProt**: `search_reactions` / `get_protein_reactions`
 - **GO**: `search_go_terms`
-- **統合**: `comprehensive_protein_analysis`（UniProt＋Reactome＋PDBの並列統合）
+- **統合**: `comprehensive_protein_analysis`（UniProt＋Rhea反応＋PDBの並列統合）
 - **横断基盤**: 共通HTTPクライアント（接続プール・リトライ・指数バックオフ）、TTLキャッシュ、レスポンスのフィールドフィルタ
 
 これによりユースケースA（タンパク質同定）は概ね充足。
@@ -136,35 +138,36 @@ TO-BE実現に向けた段階的な開発計画。各フェーズは前フェー
 | `get_known_adverse_effects(drug, size)` | Open Targets / FAERS | E（既知副作用の検索・列挙。ChEMBL ID/薬剤名を受付） |
 | `get_drug_details(chembl_id)` | ChEMBL REST | 化合物の化学的詳細（構造・作用機序・適応） |
 | `search_similar_structures(pdb_id, ...)` | RCSB structure similarity API | B（3D形状ベース類似構造） |
-| `parse_local_pdb(file, enrich)` | 軽量ヘッダーパーサ（新規依存なし） | D（手元の.pdb解析＋Reactome/GO補完） |
+| `parse_local_pdb(file, enrich)` | 軽量ヘッダーパーサ（新規依存なし） | D（手元の.pdb解析＋Rhea反応/GO補完） |
 
 **実装メモ**:
 - ChEMBL/Open Targetsは**いずれも認証不要の公開API**。既存の`make_api_request`にGraphQL POST用の薄いラッパ（`_graphql_request`）と遺伝子シンボル→Ensembl ID解決（`_resolve_ensembl_id`）を追加して対応。
 - Open Targetsの現行v4スキーマでは、ターゲットの薬剤は `knownDrugs` ではなく **`drugAndClinicalCandidates`** に変更されている（イントロスペクションで確認して対応済み）。副作用は `drug.adverseEvents`（FAERSベース、`logLR` が `criticalValue` を超えると有意）。
-- `parse_local_pdb` は方針どおり**構造解析ライブラリを導入せず**、HEADER/TITLE/COMPND/SOURCE/EXPDTA/REMARK 2/DBREF を軽量パースし、DBREFのUniProt IDから関連パスウェイ・GO注釈を補完する。全原子解析が必要になった時点で`gemmi`導入を再検討。
+- `parse_local_pdb` は方針どおり**構造解析ライブラリを導入せず**、HEADER/TITLE/COMPND/SOURCE/EXPDTA/REMARK 2/DBREF を軽量パースし、DBREFのUniProt IDから触媒反応(Rhea)・GO注釈を補完する。全原子解析が必要になった時点で`gemmi`導入を再検討。
 - Open Targetsは大量一括取得を推奨しないため、MCPからは「特定Gene/Diseaseへの絞り込みクエリ」に限定してレート制限を回避する。
 
 **完了条件**: ユースケースA〜Eすべてが単一入力で回答可能 → **達成**（実APIに対するスモークテストで全ツール動作確認済み）。
 
 ---
 
-### Phase 2: パスウェイのグラフ化とgap検出 ✅ **実装済み**
+### Phase 2: 反応ネットワークのグラフ化とgap検出 ✅ **実装済み**
 
 **目的**: 「未接続部分の検出」機能の実現（図示は将来対応）。
 
 | 実装ツール | 内容 |
 | --- | --- |
-| `build_pathway_graph(pathway_id, max_reactions, as_cytoscape)` | Reactomeの反応から**エンティティ⇄反応の二部グラフ**を構築（input→反応→outputの有向エッジ） |
-| `detect_pathway_gaps(pathway_id, max_reactions)` | グラフを**弱連結成分**に分解し、複数成分に分かれる箇所を**gap候補**として報告。境界エンティティ（供給境界／末端）も列挙 |
-| `export_pathway_cytoscape(pathway_id, max_reactions)` | **Cytoscape.js形式（elements）でエクスポート**し、外部可視化ツールへ受け渡し可能に |
+| `build_reaction_network(accessions, max_reactions, exclude_currency, as_cytoscape)` | 酵素(UniProt)集合の触媒反応(Rhea)から**代謝物⇄反応の二部グラフ**を構築（基質→反応→生成物の有向エッジ） |
+| `detect_network_gaps(accessions, max_reactions, exclude_currency)` | グラフを**弱連結成分**に分解し、複数成分に分かれる箇所を**gap候補**として報告。境界代謝物（供給境界／末端）も列挙 |
+| `export_network_cytoscape(accessions, max_reactions, exclude_currency)` | **Cytoscape.js形式（elements）でエクスポート**し、外部可視化ツールへ受け渡し可能に |
 
 **実装メモ**:
-- グラフはReactome `/pathway/{id}/containedEvents`（反応一覧）＋各反応の `/query/{id}`（input/output）から構築。containedEventsやinput/outputは**dictとbare int(dbId参照)が混在**するため、dict要素のみを対象にするガードを実装。
+- 入力は「反応でつなぎたい酵素の集合」（UniProtアクセッションのリスト）。各酵素の触媒反応をUniProtの CATALYTIC ACTIVITY 注釈から取得し、Rhea反応の基質/生成物（htmlequationの左右）で有向グラフを構築。
+- **通貨代謝物（H2O/ATP/NAD(+)等）を既定で除外**（`exclude_currency`）。これらは多数の反応に共通し、無意味な連結や見かけ上のブリッジを生むため。
 - 連結成分の検出は**新規依存を避けて自前のUnion-Find**（`_UnionFind`）で実装。networkx等は導入しない。
-- 反応ごとに1 APIコールのため `max_reactions` で上限を設け（デフォルト40）、`asyncio.gather` で並列取得。分断が反応数上限による見かけ上のものでないか `_meta.truncated` で判別可能。
+- 反応ごとに1 APIコールのため `max_reactions` で上限を設け（デフォルト40）、`asyncio.gather` で並列取得。分断が反応数上限や通貨除外による見かけ上のものでないか `_meta` で判別可能。
 - 図示自体はこのフェーズでは範囲外（Cytoscape側 or 将来のPhase 4フロントで対応）。
 
-**完了条件**: 任意パスウェイのグラフを取得し、未接続領域をリスト化して返せる → **達成**（Glycolysis等で実API動作確認済み）。
+**完了条件**: 酵素集合の反応グラフを取得し、未接続領域をリスト化して返せる → **達成**（解糖系酵素で実API動作確認済み）。
 
 ---
 
@@ -174,15 +177,16 @@ TO-BE実現に向けた段階的な開発計画。各フェーズは前フェー
 
 | 実装ツール | 内容 |
 | --- | --- |
-| `propose_gap_node_candidates(pathway_id, ...)` | gap境界の代謝物を「他の反応で消費/生成している既知反応」を辿り、そこに置きうる中間ノードの候補を列挙。特に**ある成分の境界出力を消費し別成分の境界入力を生成する反応**は「ブリッジ候補」として提示 |
+| `propose_gap_node_candidates(accessions, ...)` | gap境界の代謝物をキーにRheaで「その代謝物が関与する他の既知反応」を検索し、置きうる中間ノード（反応と、それを触媒しうる酵素）の候補を列挙。特に**異なる成分の境界代謝物を相互変換する反応**を「ブリッジ候補」として、候補酵素付きで提示 |
 
 **実装メモ**:
-- LLMによる配列生成は行わず、**Reactomeの既知反応グラフに基づくデータ駆動の候補提示**とした（`consumedByEvent` / `producedByEvent` を辿る）。境界エンティティの `referenceEntity`（ChEBI/UniProt識別子）もコンテキストとして併記。
-- 各候補には**根拠（どの境界エンティティ・どの方向から導いたか）を必ず併記**。出力に明示的な `disclaimer` を含め、**実在性の断定・新規配列生成は一切行わない**方針を明記。
-- パスウェイ自身の反応は候補から除外。`_compute_pathway_gaps` をPhase 2の `detect_pathway_gaps` と共用してgap算出ロジックを一元化。
-- あわせて `make_api_request` を**一過性5xx（500/502/503/504/520/522/524）でリトライ**するよう改善（Reactome/Cloudflareの断続的な522対策）。
+- LLMによる配列生成は行わず、**Rheaの既知反応DBに基づくデータ駆動の候補提示**とした（境界ChEBIで `_rhea_reactions_by_chebi` を検索）。ブリッジ候補反応はUniProt(`query=rhea:ID`)で触媒酵素を逆引きし、**候補ノード＝実在する酵素**として提示。
+- **Rhea反応は双方向**のため、ブリッジ判定は方向非依存（対辺に別成分の境界代謝物があれば連結できる）とした。当初は左右厳密一致で実装したが解糖系のgap検証で取りこぼしが判明し修正。
+- 各候補には**根拠（どの境界代謝物どうしを結ぶか）を必ず併記**。出力に明示的な `disclaimer` を含め、**実在性の断定・新規配列生成は一切行わない**方針を明記。
+- ネットワーク自身の反応は候補から除外。`_compute_network_gaps` をPhase 2の `detect_network_gaps` と共用してgap算出ロジックを一元化。
+- あわせて `make_api_request` を**一過性5xx（500/502/503/504/520/522/524）でリトライ**するよう改善。
 
-**完了条件**: gap入力に対し、根拠付きの候補ノードリストを仮説として返せる → **達成**（新規ロジックは合成データによるオフラインテストで検証済み。実Reactomeに対するエンドツーエンド検証はReactome側の一時的障害復旧後に実施予定。グラフ取得経路自体はPhase 2で実API実証済み）。
+**完了条件**: gap入力に対し、根拠付きの候補ノードリストを仮説として返せる → **達成**。解糖系酵素4種（PGAMを意図的に除外）で検証し、gapのブリッジ反応 RHEA:15901（2-/3-ホスホグリセリン酸の相互変換）と、その候補酵素として**除外したPGAM1(P18669)を正しく提示**することを実APIで確認。
 
 ---
 
