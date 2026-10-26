@@ -156,7 +156,7 @@ class TestPromeithicaFunctions:
     async def test_search_proteins_invalid_input(self):
         """タンパク質検索の異常ケース"""
         result = await search_proteins("", "Homo sapiens", 10)
-        assert "エラー" in result
+        assert "error" in result
         assert "検索クエリが必要です" in result
 
     async def test_get_protein_info_valid(self):
@@ -201,19 +201,15 @@ class TestPromeithicaFunctions:
     async def test_comprehensive_protein_analysis(self):
         """包括的分析のテスト"""
         # 複数のAPIレスポンスをモック
-        side_effects = [
-            MOCK_UNIPROT_DETAIL_RESPONSE,  # UniProt
-            MOCK_REACTOME_PATHWAY_RESPONSE,  # Reactome
-            MOCK_PDB_SEARCH_RESPONSE  # PDB
-        ]
+        side_effects = [MOCK_UNIPROT_DETAIL_RESPONSE, MOCK_PDB_SEARCH_RESPONSE]
         
         with patch('promethica.make_api_request', side_effect=side_effects):
-            result = await comprehensive_protein_analysis("P05067")
+            result = await comprehensive_protein_analysis("P05067", sources=["uniprot", "pdb"])
             
             result_data = json.loads(result)
             assert result_data["accession"] == "P05067"
             assert result_data["uniprot_info"] is not None
-            assert result_data["pathways"] is not None
+            assert "reactions" in result_data
             assert result_data["pdb_structures"] is not None
             assert len(result_data["error_messages"]) == 0
 
@@ -238,9 +234,10 @@ class TestMCPIntegration:
             "get_protein_sequence",
             "search_pdb_structures",
             "get_pdb_structure_info",
-            "search_pathways",
-            "get_protein_pathways",
             "search_go_terms",
+            "get_gocam_model",
+            "list_gocam_models_by_taxon",
+            "list_gocam_models_by_publication",
             "comprehensive_protein_analysis",
             "get_primary_protein_for_gene",
             "get_protein_features",
@@ -326,14 +323,14 @@ class TestCascadeCalls:
             analysis_data = json.loads(analysis_result)
             
             assert analysis_data["accession"] == accession
-            assert all(key in analysis_data for key in ["uniprot_info", "pathways", "pdb_structures"])
+            assert all(key in analysis_data for key in ["uniprot_info", "reactions", "pdb_structures"])
 
 # ===== 4. E2Eテストシナリオ =====
 
 class TestE2EScenarios:
     """エンドツーエンドテストシナリオ"""
     
-    def test_app_gene_query_scenario(self):
+    async def test_app_gene_query_scenario(self):
         """APP遺伝子に関するクエリのシナリオテスト"""
         scenario = {
             "user_query": "APP遺伝子でコードされるヒトのタンパク質のUniProtコードを教えて",
@@ -350,7 +347,7 @@ class TestE2EScenarios:
         assert len(scenario["expected_tools"]) == 2
         assert scenario["expected_results"]["accession"] == "P05067"
 
-    def test_comprehensive_analysis_scenario(self):
+    async def test_comprehensive_analysis_scenario(self):
         """包括的分析のシナリオテスト"""
         scenario = {
             "user_query": "P53タンパク質について構造、機能、関連パスウェイを教えて",

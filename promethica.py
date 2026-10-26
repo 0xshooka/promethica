@@ -12,10 +12,19 @@ Promethica MCP Server
 """
 
 import asyncio
+import copy
+import email.utils
+import gzip
+import html
 import json
 import logging
+import os
 import random
 import re
+import stat
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -42,12 +51,13 @@ APIs = {
 }
 
 CLIENT_HEADERS = {
-    "User-Agent": "Promethica-MCP-Server/1.0.0 (Drug Discovery Research Tool)",
+    "User-Agent": "Promethica-MCP-Server/0.1.0 (+https://github.com/0xshooka/promethica)",
     "Accept": "application/json",
 }
 
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 MAX_RETRIES = 3
+MAX_RETRY_DELAY = 30.0
 
 # 一過性の可能性が高いステータス（レート制限＋ゲートウェイ/サーバ系5xx）はリトライする。
 # 520/522/524 はCloudflare由来の一過性エラー。
@@ -56,6 +66,7 @@ RETRIABLE_STATUS = {429, 500, 502, 503, 504, 520, 522, 524}
 # Module-level client with connection pooling. Lazily created to avoid loop issues.
 _client: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
+_request_semaphore = asyncio.Semaphore(20)
 
 # Simple TTL cache for idempotent GET responses (keyed by method+url+params).
 _response_cache: TTLCache = TTLCache(maxsize=256, ttl=600)
@@ -90,16 +101,66 @@ def _ok(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-def _read_text_file(path: str, max_bytes: int = 20 * 1024 * 1024) -> str:
-    """ローカルテキストファイルを読み込む（.gz にも対応、サイズ上限あり）。同期I/Oなのでto_thread経由で呼ぶ。"""
-    import gzip
-    import os
+def _allowed_pdb_roots() -> list[Path]:
+    """ローカルPDB読取を許可するルート。未設定時はサーバー起動ディレクトリのみ。"""
+    configured = os.environ.get("PROMETHICA_ALLOWED_PDB_DIRS", "")
+    roots = [Path(p).expanduser() for p in configured.split(os.pathsep) if p.strip()]
+    return [p.resolve(strict=True) for p in (roots or [Path.cwd()])]
 
-    if os.path.getsize(path) > max_bytes:
-        raise OSError(f"ファイルが大きすぎます（上限 {max_bytes // (1024 * 1024)}MB）")
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt", encoding="utf-8", errors="replace") as f:
-        return f.read()
+
+def _read_text_file(path: str, max_bytes: int = 20 * 1024 * 1024) -> str:
+    """許可ルート内のPDBテキストを、展開後サイズ上限付きで読む。"""
+    requested = Path(path).expanduser()
+    resolved = requested.resolve(strict=True)
+    if not any(resolved == root or root in resolved.parents for root in _allowed_pdb_roots()):
+        raise PermissionError(
+            "許可ディレクトリ外です。PROMETHICA_ALLOWED_PDB_DIRS で読取ルートを設定してください"
+        )
+    mode = resolved.stat().st_mode
+    if not stat.S_ISREG(mode):
+        raise OSError("通常ファイルではありません")
+    lower = resolved.name.lower()
+    if not lower.endswith((".pdb", ".ent", ".pdb.gz", ".ent.gz")):
+        raise OSError("対応形式は .pdb/.ent（任意で .gz）のみです")
+    if resolved.stat().st_size > max_bytes:
+        raise OSError(f"圧縮前ファイルが大きすぎます（上限 {max_bytes // (1024 * 1024)}MB）")
+
+    opener = gzip.open if lower.endswith(".gz") else open
+    chunks: list[str] = []
+    total = 0
+    with opener(resolved, "rt", encoding="utf-8", errors="replace") as stream:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk.encode("utf-8"))
+            if total > max_bytes:
+                raise OSError(f"展開後ファイルが大きすぎます（上限 {max_bytes // (1024 * 1024)}MB）")
+            chunks.append(chunk)
+    return "".join(chunks)
+
+
+def _stable_cache_key(url: str, params: Optional[dict]) -> tuple[str, str]:
+    return url, json.dumps(params or {}, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    value = response.headers.get("Retry-After", "").strip()
+    delay: Optional[float] = None
+    if value:
+        try:
+            delay = float(value)
+        except ValueError:
+            try:
+                when = email.utils.parsedate_to_datetime(value)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                delay = (when - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                pass
+    if delay is None:
+        delay = 2 ** attempt + random.random()
+    return max(0.0, min(delay, MAX_RETRY_DELAY))
 
 
 async def make_api_request(
@@ -109,10 +170,10 @@ async def make_api_request(
     content: Optional[str] = None,
     extra_headers: Optional[dict] = None,
     use_cache: bool = True,
-) -> dict[str, Any]:
+) -> Any:
     """汎用APIリクエスト関数。
 
-    戻り値は常にdict: 成功時はJSON/テキストデコード済みデータ、失敗時は {"_error": ..., "_status": ...}。
+    成功時はJSON値（object/array）またはテキストラッパー、失敗時は {"_error": ..., "_status": ...}。
     - 429/503 はRetry-Afterを尊重して指数バックオフで最大MAX_RETRIES回リトライ
     - ネットワーク/タイムアウトもリトライ
     - GET結果は短時間TTLキャッシュ
@@ -120,53 +181,62 @@ async def make_api_request(
     method = "POST" if (json_data is not None or content is not None) else "GET"
     cache_key = None
     if method == "GET" and use_cache:
-        cache_key = (url, tuple(sorted((params or {}).items())))
+        cache_key = _stable_cache_key(url, params)
         if cache_key in _response_cache:
-            return _response_cache[cache_key]
+            return copy.deepcopy(_response_cache[cache_key])
 
     client = await _get_client()
     last_err: dict[str, Any] = {"_error": "unknown", "_status": None}
 
     for attempt in range(MAX_RETRIES):
         try:
-            if method == "POST":
-                if json_data is not None:
+            async with _request_semaphore:
+                if method == "POST" and json_data is not None:
                     response = await client.post(url, params=params, json=json_data, headers=extra_headers)
-                else:
+                elif method == "POST":
                     response = await client.post(url, params=params, content=content, headers=extra_headers)
-            else:
-                response = await client.get(url, params=params, headers=extra_headers)
+                else:
+                    response = await client.get(url, params=params, headers=extra_headers)
 
             if response.status_code in RETRIABLE_STATUS:
-                retry_after = response.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt + random.random()
-                logger.warning("retriable status %s %s (attempt=%s, sleep=%.1fs)", response.status_code, url, attempt + 1, delay)
-                last_err = {"_error": f"HTTP {response.status_code}", "_status": response.status_code}
-                await asyncio.sleep(delay)
+                last_err = {"_error": f"HTTP {response.status_code}", "_status": response.status_code,
+                            "_body": response.text[:500]}
+                if attempt + 1 < MAX_RETRIES:
+                    delay = _retry_delay(response, attempt)
+                    logger.warning("retriable status %s %s (attempt=%s, sleep=%.1fs)", response.status_code, url, attempt + 1, delay)
+                    await asyncio.sleep(delay)
                 continue
 
             if response.status_code >= 400:
                 logger.warning("http error %s %s: %s", response.status_code, url, response.text[:200])
                 return {"_error": f"HTTP {response.status_code}", "_status": response.status_code, "_body": response.text[:500]}
 
-            content_type = response.headers.get("content-type", "")
-            if "application/json" in content_type:
+            if response.status_code == 204:
+                result: Any = {"_empty": True, "_status": 204}
+            else:
+                content_type = response.headers.get("content-type", "").lower()
                 try:
-                    return response.json()
-                except json.JSONDecodeError as e:
+                    result = response.json() if ("json" in content_type or response.text.lstrip().startswith(("{", "["))) else {
+                        "text": response.text, "content_type": content_type
+                    }
+                except (json.JSONDecodeError, ValueError) as e:
                     return {"_error": f"invalid JSON: {e}", "_status": response.status_code, "_body": response.text[:500]}
-            return {"text": response.text, "content_type": content_type}
+            if cache_key is not None:
+                _response_cache[cache_key] = copy.deepcopy(result)
+            return result
 
         except (httpx.TimeoutException, httpx.TransportError) as e:
-            delay = 2 ** attempt + random.random()
-            logger.warning("network error %s (attempt=%s): %s; sleep=%.1fs", url, attempt + 1, e, delay)
-            last_err = {"_error": f"network: {type(e).__name__}", "_status": None}
-            await asyncio.sleep(delay)
+            last_err = {"_error": f"network: {type(e).__name__}", "_status": None,
+                        "_detail": str(e)[:500], "_url": url}
+            if attempt + 1 < MAX_RETRIES:
+                delay = min(2 ** attempt + random.random(), MAX_RETRY_DELAY)
+                logger.warning("network error %s (attempt=%s): %s; sleep=%.1fs", url, attempt + 1, e, delay)
+                await asyncio.sleep(delay)
 
     return last_err
 
 
-def _is_error(result: dict) -> bool:
+def _is_error(result: Any) -> bool:
     return isinstance(result, dict) and "_error" in result
 
 
@@ -202,7 +272,7 @@ async def _resolve_ensembl_id(gene: str) -> Optional[str]:
 
     query = """
     query resolveTarget($q: String!) {
-      search(queryString: $q, entityNames: ["target"], page: {index: 0, size: 1}) {
+      search(queryString: $q, entityNames: ["target"], page: {index: 0, size: 10}) {
         hits { id entity name }
       }
     }
@@ -211,9 +281,10 @@ async def _resolve_ensembl_id(gene: str) -> Optional[str]:
     if _is_error(data):
         return None
     hits = (data.get("search") or {}).get("hits") or []
-    for h in hits:
-        if h.get("entity") == "target" and h.get("id"):
-            return h["id"]
+    exact = [h for h in hits if h.get("entity") == "target" and h.get("id")
+             and str(h.get("name", "")).casefold() == g.casefold()]
+    if len(exact) == 1:
+        return exact[0]["id"]
     return None
 
 
@@ -250,6 +321,13 @@ DEFAULT_FIELDS = [
 # すべてのフィールド
 ALL_FIELD_NAMES = sorted(UNIPROT_FIELD_MAP.keys())
 
+UNIPROT_COMMENT_TYPES: dict[str, set[str]] = {
+    "function": {"FUNCTION", "CATALYTIC ACTIVITY", "COFACTOR", "PATHWAY"},
+    "subcellular_location": {"SUBCELLULAR LOCATION"},
+    "disease": {"DISEASE"},
+    "interaction": {"INTERACTION"},
+}
+
 
 def _filter_uniprot_response(data: dict, fields: Optional[list[str]] = None) -> dict:
     """UniProt JSONレスポンスを指定フィールドでフィルタする。
@@ -275,6 +353,10 @@ def _filter_uniprot_response(data: dict, fields: Optional[list[str]] = None) -> 
     allowed_keys.update(UNIPROT_FIELD_MAP["basic"])
 
     filtered = {k: v for k, v in data.items() if k in allowed_keys}
+    if "comments" in filtered:
+        wanted_types = set().union(*(UNIPROT_COMMENT_TYPES.get(name, set()) for name in selected))
+        filtered["comments"] = [c for c in filtered["comments"]
+                                if c.get("commentType") in wanted_types]
 
     # メタ情報として、除外されたフィールドがあることを示す
     excluded = [f for f in ALL_FIELD_NAMES if f not in selected and f != "basic"]
@@ -608,6 +690,8 @@ async def parse_local_pdb(file_path: str, enrich: bool = True) -> str:
         text = await asyncio.to_thread(_read_text_file, path)
     except FileNotFoundError:
         return _err(f"ファイルが見つかりません: {path}")
+    except PermissionError as e:
+        return _err(f"ファイルへのアクセスが許可されていません: {e}")
     except OSError as e:
         return _err(f"ファイルの読み込みに失敗しました: {e}")
 
@@ -615,6 +699,9 @@ async def parse_local_pdb(file_path: str, enrich: bool = True) -> str:
         return _err("PDBフォーマットとして認識できませんでした（HEADER/ATOM行が見つかりません）", file_path=path)
 
     header = _parse_pdb_header(text)
+    if not any((header.get("pdb_id"), header.get("title"), header.get("experimental_method"),
+                header.get("uniprot_accessions"))):
+        return _err("PDBレコードはありますが、解析可能なヘッダー情報を取得できませんでした", file_path=path)
     out: dict[str, Any] = {"file_path": path, "header": header}
 
     if enrich and header["uniprot_accessions"]:
@@ -675,10 +762,6 @@ _CURRENCY_CHEBI: dict[str, str] = {
     "CHEBI:16240": "H2O2", "CHEBI:29985": "L-glutamate", "CHEBI:33813": "pyrophosphate",
 }
 
-_RHEA_PART_RE = re.compile(r'<a data-molid="chebi:(\d+)"[^>]*>(.*?)</a>', re.S)
-_TAG_RE = re.compile(r"<[^>]+>")
-
-
 def _rhea_num(rhea_id: str) -> str:
     """'RHEA:10300' / 'rhea:10300' / '10300' から数値部分を取り出す。"""
     return rhea_id.strip().split(":")[-1]
@@ -686,26 +769,67 @@ def _rhea_num(rhea_id: str) -> str:
 
 def _chebi_norm(chebi_id: str) -> str:
     """'chebi:15377' / 'CHEBI:15377' / '15377' を 'CHEBI:15377' に正規化する。"""
-    return f"CHEBI:{chebi_id.strip().split(':')[-1]}"
+    value = chebi_id.strip().split(":")[-1]
+    if not re.fullmatch(r"\d+", value):
+        raise ValueError(f"不正なChEBI ID: {chebi_id}")
+    return f"CHEBI:{value}"
 
 
-def _parse_rhea_participants(html: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+class _RheaEquationParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.participants: list[tuple[str, str]] = []
+        self._molid: Optional[str] = None
+        self._label: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag == "a":
+            molid = dict(attrs).get("data-molid")
+            if molid and re.fullmatch(r"(?:chebi|rhea-comp):\d+", molid, re.IGNORECASE):
+                prefix, value = molid.split(":", 1)
+                self._molid = f"{prefix.upper()}:{value}"
+                self._label = []
+
+    def handle_data(self, data: str) -> None:
+        if self._molid:
+            self._label.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._molid:
+            normalized = (_chebi_norm(self._molid) if self._molid.startswith("CHEBI:") else self._molid)
+            self.participants.append((normalized, html.unescape("".join(self._label)).strip()))
+            self._molid = None
+            self._label = []
+
+
+def _rhea_direction(equation: str) -> str:
+    if "<=>" in equation:
+        return "bidirectional"
+    if "=>" in equation:
+        return "left_to_right"
+    if "<=" in equation:
+        return "right_to_left"
+    return "undefined"
+
+
+def _parse_rhea_participants(html_text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Rheaのhtmlequationから左辺(基質)/右辺(生成物)の (ChEBI, 名前) リストを抽出する。
 
     反応式は ' = ' で基質と生成物に分かれ、各参加物質は data-molid="chebi:N" を持つ。
     """
-    parts = re.split(r"</span>\s*=\s*<span", html, maxsplit=1)
-    if len(parts) == 2:
-        left_html, right_html = parts[0], parts[1]
-    else:
-        seg = html.split(" = ", 1)
-        left_html, right_html = seg[0], (seg[1] if len(seg) > 1 else "")
-
-    def side(h: str) -> list[tuple[str, str]]:
-        return [(_chebi_norm(cid), _TAG_RE.sub("", name_html).strip())
-                for cid, name_html in _RHEA_PART_RE.findall(h)]
-
-    return side(left_html), side(right_html)
+    parts = re.split(
+        r"</span>\s*(?:&lt;=&gt;|&lt;=|=&gt;|<=>|<=|=>|=)\s*<span(?:\s[^>]*)?>",
+        html_text,
+        maxsplit=1,
+    )
+    if len(parts) != 2:
+        return [], []
+    parsed: list[list[tuple[str, str]]] = []
+    for part in parts:
+        parser = _RheaEquationParser()
+        parser.feed(part)
+        parsed.append(parser.participants)
+    return parsed[0], parsed[1]
 
 
 async def _fetch_rhea_reaction(rhea_id: str) -> dict[str, Any]:
@@ -719,7 +843,8 @@ async def _fetch_rhea_reaction(rhea_id: str) -> dict[str, Any]:
         return {"_error": f"Rhea反応 {rhea_id} が見つかりませんでした", "_status": None}
     r = results[0]
     left, right = _parse_rhea_participants(r.get("htmlequation", ""))
-    return {"rhea_id": f"RHEA:{r.get('id')}", "equation": r.get("equation"), "left": left, "right": right}
+    return {"rhea_id": f"RHEA:{r.get('id')}", "equation": r.get("equation"),
+            "direction": _rhea_direction(r.get("equation") or ""), "left": left, "right": right}
 
 
 async def _uniprot_catalytic_reactions(accession: str) -> dict[str, Any]:
@@ -758,6 +883,7 @@ async def _rhea_reactions_by_chebi(chebi_id: str, limit: int) -> dict[str, Any]:
     for r in (res.get("results") or []):
         left, right = _parse_rhea_participants(r.get("htmlequation", ""))
         out.append({"rhea_id": f"RHEA:{r.get('id')}", "equation": r.get("equation"),
+                    "direction": _rhea_direction(r.get("equation") or ""),
                     "left": left, "right": right})
     return {"reactions": out}
 
@@ -859,25 +985,202 @@ async def get_protein_reactions(accession: str) -> str:
 
 
 @mcp.tool()
-async def search_go_terms(go_term: Optional[str] = None, query: Optional[str] = None) -> str:
-    """Gene Ontology用語を検索
+async def search_go_terms(go_term: Optional[str] = None, limit: int = 20) -> str:
+    """GO term IDに紐づく注釈を取得（キーワード検索ではない）。
 
     Args:
         go_term: GO term ID（例: GO:0005524）
-        query: 検索クエリ（go_termまたはqueryのいずれかが必要）
     """
-    if not go_term and not query:
-        return _err("GO term IDまたは検索クエリが必要です")
+    if not go_term or not re.fullmatch(r"GO:\d{7}", go_term.strip(), re.IGNORECASE):
+        return _err("GO term IDは GO:0005524 の形式で指定してください")
 
-    if go_term:
-        url = f"{APIs['go']}/bioentity/{quote(go_term.strip(), safe=':')}"
-    else:
-        url = f"{APIs['go']}/search/entity/{quote(query.strip(), safe='')}"
+    normalized = go_term.strip().upper()
+    url = f"{APIs['go']}/bioentity/function/{quote(normalized, safe=':')}"
 
-    result = await make_api_request(url)
+    limit = max(1, min(limit, 100))
+    result = await make_api_request(url, {"start": 0, "rows": limit})
     if _is_error(result):
-        return _err("Gene Ontology検索に失敗しました", **result)
-    return _ok(result)
+        return _err("GO APIからのデータ取得に失敗しました", **result)
+    return _ok({"go_term": normalized, "annotations": result})
+
+
+@mcp.tool()
+async def get_go_term_annotations(go_term: str, limit: int = 20) -> str:
+    """正確なGO term IDに紐づく注釈を取得する。`search_go_terms` の明確な名称の別名。"""
+    return await search_go_terms(go_term, limit)
+
+
+def _normalize_gocam_id(model_id: str) -> Optional[str]:
+    value = model_id.strip()
+    if value.lower().startswith("gomodel:"):
+        value = value.split(":", 1)[1]
+    return value if re.fullmatch(r"[A-Za-z0-9._-]+", value) else None
+
+
+def _normalize_taxon_id(taxon: str) -> Optional[str]:
+    value = taxon.strip()
+    if re.fullmatch(r"\d+", value):
+        value = f"NCBITaxon:{value}"
+    match = re.fullmatch(r"NCBITaxon:(\d+)", value, re.IGNORECASE)
+    return f"NCBITaxon:{match.group(1)}" if match else None
+
+
+def _normalize_pmid(pmid: str) -> Optional[str]:
+    value = pmid.strip()
+    if value.upper().startswith("PMID:"):
+        value = value.split(":", 1)[1]
+    return value if re.fullmatch(r"\d+", value) else None
+
+
+def _gocam_evidence(items: Any) -> list[dict[str, Any]]:
+    return [
+        {"eco_id": item.get("term"), "reference": item.get("reference"),
+         "with_objects": item.get("with_objects") or [],
+         "provenance": item.get("provenances") or []}
+        for item in (items or []) if isinstance(item, dict)
+    ]
+
+
+def _summarize_gocam(model: dict[str, Any], include_details: bool = False,
+                     include_evidence: bool = False, max_activities: int = 50) -> dict[str, Any]:
+    """gocam-py LinkML JSONを、複合体を失わない軽量JSONへ変換する。"""
+    labels = {obj.get("id"): obj.get("label") for obj in (model.get("objects") or [])
+              if isinstance(obj, dict) and obj.get("id")}
+    activities: list[dict[str, Any]] = []
+    causal: list[dict[str, Any]] = []
+    all_activities = model.get("activities") or []
+    for activity in all_activities[:max_activities]:
+        if not isinstance(activity, dict):
+            continue
+        enabler = activity.get("enabled_by") or {}
+        enabler_id = enabler.get("term")
+        mf = activity.get("molecular_function") or {}
+        summary: dict[str, Any] = {
+            "id": activity.get("id"),
+            "molecular_function": {"id": mf.get("term"), "label": labels.get(mf.get("term"))},
+            "enabled_by": ({
+                "type": enabler.get("type"), "id": enabler_id, "label": labels.get(enabler_id),
+                "members": [{"id": member, "label": labels.get(member)}
+                            for member in (enabler.get("members") or [])],
+            } if enabler else None),
+        }
+        if include_details:
+            for source, target in (("part_of", "biological_process"), ("occurs_in", "occurs_in")):
+                assoc = activity.get(source) or {}
+                summary[target] = ({"id": assoc.get("term"), "label": labels.get(assoc.get("term"))}
+                                   if assoc else None)
+            for field in ("has_input", "has_primary_input", "has_output", "has_primary_output"):
+                summary[field] = [{"id": assoc.get("term"), "label": labels.get(assoc.get("term"))}
+                                  for assoc in (activity.get(field) or []) if isinstance(assoc, dict)]
+        if include_evidence:
+            summary["evidence"] = {
+                "enabled_by": _gocam_evidence(enabler.get("evidence")),
+                "molecular_function": _gocam_evidence(mf.get("evidence")),
+            }
+        activities.append(summary)
+        for association in (activity.get("causal_associations") or []):
+            if not isinstance(association, dict):
+                continue
+            evidence = _gocam_evidence(association.get("evidence"))
+            edge: dict[str, Any] = {
+                "upstream_activity": activity.get("id"), "predicate": association.get("predicate"),
+                "downstream_activity": association.get("downstream_activity"),
+                "has_evidence": bool(evidence),
+            }
+            if include_evidence:
+                edge["evidence"] = evidence
+                edge["provenance"] = association.get("provenances") or []
+            causal.append(edge)
+    result: dict[str, Any] = {
+        "id": model.get("id"), "title": model.get("title"), "taxon": model.get("taxon"),
+        "taxon_label": model.get("taxon_label") or labels.get(model.get("taxon")),
+        "status": model.get("status"), "activity_count": len(all_activities),
+        "causal_association_count": len(causal), "activities": activities,
+        "causal_associations": causal, "truncated": len(all_activities) > max_activities,
+        "interpretation_note": (
+            "GO-CAMは分子活動とその関係を表すキュレーションモデルです。モデルや因果エッジの存在は、"
+            "研究結論が確証済みであることを意味しません。has_evidence と参照文献を確認してください。"
+        ),
+    }
+    if include_details:
+        result["comments"] = model.get("comments") or []
+        result["provenance"] = model.get("provenances") or []
+    return result
+
+
+async def _fetch_gocam_summary(model_id: str) -> dict[str, Any]:
+    model = await make_api_request(f"{APIs['go']}/gocam-model/{quote(model_id, safe='')}")
+    if _is_error(model) or not isinstance(model, dict):
+        return {"id": f"gomodel:{model_id}", "fetch_error": model}
+    summary = _summarize_gocam(model, max_activities=0)
+    return {k: summary.get(k) for k in
+            ("id", "title", "taxon", "taxon_label", "status", "activity_count")}
+
+
+@mcp.tool()
+async def get_gocam_model(model_id: str, include_details: bool = False,
+                          include_evidence: bool = False, max_activities: int = 50) -> str:
+    """GO-CAMモデルを取得し、活動・遺伝子産物/複合体・因果関係を要約する。"""
+    normalized = _normalize_gocam_id(model_id)
+    if not normalized:
+        return _err("GO-CAM model IDが不正です")
+    max_activities = max(1, min(max_activities, 200))
+    result = await make_api_request(f"{APIs['go']}/gocam-model/{quote(normalized, safe='')}")
+    if _is_error(result):
+        return _err(f"GO-CAMモデル {model_id} の取得に失敗しました", **result)
+    if not isinstance(result, dict):
+        return _err("GO-CAM APIが想定外の形式を返しました")
+    return _ok(_summarize_gocam(result, include_details, include_evidence, max_activities))
+
+
+async def _list_gocam_models(path: str, limit: int) -> dict[str, Any]:
+    raw = await make_api_request(path)
+    if _is_error(raw):
+        return raw
+    if not isinstance(raw, list):
+        return {"_error": "GO-CAM APIが想定外の一覧形式を返しました", "_status": None}
+    ids: list[str] = []
+    for item in raw:
+        value = item.get("gocam") if isinstance(item, dict) else None
+        if value:
+            normalized = _normalize_gocam_id(value.rstrip("/").rsplit("/", 1)[-1])
+            if normalized:
+                ids.append(normalized)
+    summaries = await asyncio.gather(*[_fetch_gocam_summary(mid) for mid in ids[:limit]])
+    return {
+        "total_returned_by_api": len(ids), "returned_to_client": len(summaries), "models": summaries,
+        "truncated": len(ids) > limit,
+        "pagination": "The current GO API route exposes no pagination parameters; limit is applied client-side after retrieval.",
+    }
+
+
+@mcp.tool()
+async def list_gocam_models_by_taxon(taxon: str, limit: int = 20) -> str:
+    """NCBITaxon CURIEに紐づくGO-CAMモデル一覧。生物種名の推測解決はしない。"""
+    normalized = _normalize_taxon_id(taxon)
+    if not normalized:
+        return _err("taxonは NCBITaxon:9606（または数字のみ）の形式で指定してください")
+    limit = max(1, min(limit, 100))
+    result = await _list_gocam_models(
+        f"{APIs['go']}/taxon/{quote(normalized, safe=':')}/models", limit)
+    if _is_error(result):
+        return _err(f"分類群 {normalized} のGO-CAM一覧取得に失敗しました", **result)
+    return _ok({"taxon": normalized, **result})
+
+
+@mcp.tool()
+async def list_gocam_models_by_publication(pmid: str, limit: int = 20) -> str:
+    """PMIDに紐づくGO-CAMモデル一覧。0件は正常結果として扱う。"""
+    normalized = _normalize_pmid(pmid)
+    if not normalized:
+        return _err("PMIDは数字または PMID:123456 の形式で指定してください")
+    limit = max(1, min(limit, 100))
+    result = await _list_gocam_models(
+        f"{APIs['go']}/pmid/{quote(normalized, safe='')}/models", limit)
+    if _is_error(result):
+        return _err(f"PMID:{normalized} のGO-CAM一覧取得に失敗しました", **result)
+    return _ok({"pmid": f"PMID:{normalized}", **result,
+                "interpretation_note": "モデルとの関連は、その文献の結論が確証済みであることを意味しません。"})
 
 
 # ===== Open Targets関連ツール（疾患関連・既知薬・副作用） =====
@@ -937,6 +1240,7 @@ async def get_disease_associations(gene: str, size: int = 25) -> str:
             for r in assoc.get("rows", [])
         ],
         "source": "Open Targets Platform",
+        "interpretation_note": "association_scoreは複数のエビデンスを統合した関連度であり、因果関係や創薬成功確率ではありません。",
     })
 
 
@@ -1037,7 +1341,7 @@ async def get_known_adverse_effects(drug: str, size: int = 25) -> str:
     if chembl_id is None:
         resolve_q = """
         query resolveDrug($q: String!) {
-          search(queryString: $q, entityNames: ["drug"], page: {index: 0, size: 1}) {
+          search(queryString: $q, entityNames: ["drug"], page: {index: 0, size: 10}) {
             hits { id entity name }
           }
         }
@@ -1046,10 +1350,10 @@ async def get_known_adverse_effects(drug: str, size: int = 25) -> str:
         if _is_error(rdata):
             return _err(f"薬剤 {drug} の解決に失敗しました", **rdata)
         hits = (rdata.get("search") or {}).get("hits") or []
-        for h in hits:
-            if h.get("entity") == "drug" and h.get("id"):
-                chembl_id = h["id"]
-                break
+        exact = [h for h in hits if h.get("entity") == "drug" and h.get("id")
+                 and str(h.get("name", "")).casefold() == d.casefold()]
+        if len(exact) == 1:
+            chembl_id = exact[0]["id"]
         if chembl_id is None:
             return _err(f"薬剤 {drug} をChEMBL IDに解決できませんでした")
 
@@ -1090,7 +1394,8 @@ async def get_known_adverse_effects(drug: str, size: int = 25) -> str:
             }
             for r in aes.get("rows", [])
         ],
-        "note": "FAERSベースの既知の有害事象報告。logLRが criticalValue を上回るものが統計的に有意。",
+        "note": ("FAERSベースの自発報告シグナルです。logLRとcriticalValueは不均衡解析の指標であり、"
+                 "薬剤が事象を引き起こしたという因果関係、発生率、個人リスクを証明しません。"),
         "source": "Open Targets Platform / FDA FAERS",
     })
 
@@ -1214,7 +1519,7 @@ async def _build_reaction_network_data(
 
     戻り値: {"nodes": {...}, "edges": [...], "reactions": [...], "_meta": {...}} または {"_error": ...}。
     ノードキー: 反応=RHEA:ID / 代謝物=CHEBI:ID。
-    エッジ: 基質→反応(input) / 反応→生成物(output)。方向はRheaの反応式の左右に従う。
+    エッジ方向はRheaの方向指定に従う。方向未定義("=")では participant としてのみ接続する。
     """
     accs = [a.strip() for a in accessions if a and a.strip()]
     if not accs:
@@ -1227,8 +1532,14 @@ async def _build_reaction_network_data(
     rhea_to_enzymes: dict[str, list[str]] = {}
     rhea_meta: dict[str, dict] = {}
     enzymes_without_reactions: list[str] = []
+    enzyme_fetch_failures: list[dict[str, Any]] = []
     for acc, res in zip(accs, cat_results):
-        if isinstance(res, Exception) or _is_error(res):
+        if isinstance(res, Exception):
+            enzyme_fetch_failures.append({"accession": acc, "reason": type(res).__name__, "detail": str(res)[:300]})
+            continue
+        if _is_error(res):
+            enzyme_fetch_failures.append({"accession": acc, "reason": res.get("_error"),
+                                           "status": res.get("_status")})
             continue
         has = False
         for r in res.get("reactions", []):
@@ -1244,12 +1555,18 @@ async def _build_reaction_network_data(
             enzymes_without_reactions.append(acc)
 
     if not rhea_to_enzymes:
-        return {"_error": "指定した酵素にRhea反応が見つかりませんでした（酵素でない可能性があります）",
-                "_status": None, "accessions": accs}
+        if enzyme_fetch_failures:
+            return {"_error": "必要なUniProtデータを取得できず、反応ネットワークを検出不能です",
+                    "_status": None, "accessions": accs, "fetch_failures": enzyme_fetch_failures,
+                    "analysis_possible": False}
+        return {"_error": "指定した酵素にRhea注釈がありません（反応が存在しないことを意味しません）",
+                "_status": None, "accessions": accs, "annotation_absent": enzymes_without_reactions,
+                "analysis_possible": False}
 
     rhea_ids = list(rhea_to_enzymes.keys())
     total_reactions = len(rhea_ids)
     truncated = total_reactions > max_reactions
+    skipped_by_limit = rhea_ids[max_reactions:]
     rhea_ids = rhea_ids[:max_reactions]
 
     # 2. 各Rhea反応の構造化参加物質を並列取得
@@ -1260,31 +1577,71 @@ async def _build_reaction_network_data(
     nodes: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, str]] = []
     processed: list[dict[str, Any]] = []
+    reaction_fetch_failures: list[dict[str, Any]] = []
 
     def _metabolite_node(chebi: str, name: str) -> Optional[str]:
         if exclude_currency and chebi in _CURRENCY_CHEBI:
             return None
         if chebi not in nodes:
-            nodes[chebi] = {"id": chebi, "label": name or chebi, "type": "metabolite"}
+            nodes[chebi] = {"id": chebi, "label": name or chebi,
+                            "type": "metabolite" if chebi.startswith("CHEBI:") else "rhea_component"}
         return chebi
 
     for rid, detail in zip(rhea_ids, details):
-        if isinstance(detail, Exception) or _is_error(detail):
+        if isinstance(detail, Exception):
+            reaction_fetch_failures.append({"rhea_id": rid, "reason": type(detail).__name__,
+                                             "detail": str(detail)[:300]})
+            continue
+        if _is_error(detail):
+            reaction_fetch_failures.append({"rhea_id": rid, "reason": detail.get("_error"),
+                                             "status": detail.get("_status")})
             continue
         meta = rhea_meta.get(rid, {})
         label = meta.get("name") or detail.get("equation") or rid
         nodes[rid] = {
             "id": rid, "label": label, "type": "reaction",
             "ec": meta.get("ec"), "equation": detail.get("equation"),
+            "direction": detail.get("direction", "undefined"),
             "enzymes": rhea_to_enzymes.get(rid, []),
         }
-        subs = [s for s in (_metabolite_node(c, n) for c, n in detail["left"]) if s]
-        prods = [p for p in (_metabolite_node(c, n) for c, n in detail["right"]) if p]
-        for s in subs:
-            edges.append({"id": f"{s}->{rid}", "source": s, "target": rid, "role": "input"})
-        for p in prods:
-            edges.append({"id": f"{rid}->{p}", "source": rid, "target": p, "role": "output"})
-        processed.append({"rhea_id": rid, "name": label, "substrates": subs, "products": prods})
+        left = [s for s in (_metabolite_node(c, n) for c, n in detail["left"]) if s]
+        right = [p for p in (_metabolite_node(c, n) for c, n in detail["right"]) if p]
+        direction = detail.get("direction", "undefined")
+
+        def connect(inputs: list[str], outputs: list[str], suffix: str = "") -> None:
+            for item in inputs:
+                edges.append({"id": f"{item}->{rid}{suffix}", "source": item, "target": rid,
+                              "role": "input", "direction": direction})
+            for item in outputs:
+                edges.append({"id": f"{rid}->{item}{suffix}", "source": rid, "target": item,
+                              "role": "output", "direction": direction})
+
+        if direction == "left_to_right":
+            connect(left, right)
+        elif direction == "right_to_left":
+            connect(right, left)
+        elif direction == "bidirectional":
+            connect(left, right, ":forward")
+            connect(right, left, ":reverse")
+        else:
+            for item in left + right:
+                edges.append({"id": f"{item}--{rid}", "source": item, "target": rid,
+                              "role": "participant", "direction": "undefined"})
+        processed.append({"rhea_id": rid, "name": label, "left": left, "right": right,
+                          "direction": direction})
+
+    if not processed and reaction_fetch_failures:
+        return {"_error": "必要なRhea反応データを取得できず、反応ネットワークを検出不能です",
+                "_status": None, "accessions": accs, "reaction_fetch_failures": reaction_fetch_failures,
+                "analysis_possible": False}
+
+    incomplete_reasons = []
+    if enzyme_fetch_failures:
+        incomplete_reasons.append("uniprot_fetch_failures")
+    if reaction_fetch_failures:
+        incomplete_reasons.append("rhea_fetch_failures")
+    if truncated:
+        incomplete_reasons.append("max_reactions_truncation")
 
     return {
         "nodes": nodes,
@@ -1293,11 +1650,19 @@ async def _build_reaction_network_data(
         "_meta": {
             "accessions": accs,
             "enzymes_without_reactions": enzymes_without_reactions,
+            "enzyme_fetch_failures": enzyme_fetch_failures,
+            "reaction_fetch_failures": reaction_fetch_failures,
             "total_reactions": total_reactions,
             "reactions_processed": len(processed),
             "truncated": truncated,
             "max_reactions": max_reactions,
+            "skipped_reaction_ids_by_limit": skipped_by_limit,
             "currency_excluded": exclude_currency,
+            "complete": not incomplete_reasons,
+            "completeness": "complete" if not incomplete_reasons else "partial",
+            "incomplete_reasons": incomplete_reasons,
+            "analysis_possible": bool(processed),
+            "direction_note": "Rhea '=' is direction-undefined; left/right are not substrate/product. Boundary analysis excludes undefined-direction reactions.",
         },
     }
 
@@ -1426,6 +1791,7 @@ async def detect_network_gaps(
             "size": len(comp),
             "reactions": sum(1 for n in comp if nodes[n]["type"] == "reaction"),
             "metabolites": sum(1 for n in comp if nodes[n]["type"] == "metabolite"),
+            "rhea_components": sum(1 for n in comp if nodes[n]["type"] == "rhea_component"),
             "sample_labels": [nodes[n]["label"] for n in comp if nodes[n]["type"] == "metabolite"][:5],
         }
         for comp in components
@@ -1435,7 +1801,13 @@ async def detect_network_gaps(
     boundary_outputs = [{"id": n, "label": nodes[n]["label"]} for n in gaps["boundary_outputs"]]
 
     num_components = len(components)
-    if num_components <= 1:
+    complete = graph["_meta"]["complete"]
+    if not complete:
+        interpretation = (
+            f"利用可能なデータでは{num_components}個の弱連結成分です。ただし取得失敗または打ち切りがあり、"
+            "科学的なgapの有無は確定できません。欠落データを『反応なし』と解釈しないでください。"
+        )
+    elif num_components <= 1:
         interpretation = "単一の連結成分。反応ネットワーク上に明示的な分断（gap）は検出されませんでした。"
     else:
         interpretation = (
@@ -1451,6 +1823,8 @@ async def detect_network_gaps(
         "boundary_outputs": boundary_outputs[:20],
         "boundary_inputs_count": len(boundary_inputs),
         "boundary_outputs_count": len(boundary_outputs),
+        "gap_detection_status": "complete" if complete else "indeterminate_incomplete_data",
+        "gap_present": (num_components > 1) if complete else None,
         "interpretation": interpretation,
         "_meta": graph["_meta"],
         "note": "境界代謝物は外部供給される基質/末端生成物。分断が反応数上限や通貨代謝物除外による"
@@ -1545,10 +1919,16 @@ async def propose_gap_node_candidates(
         cid: r for cid, r in zip(query_ids, search_results)
         if not isinstance(r, Exception) and not _is_error(r)
     }
+    boundary_search_failures = [
+        {"chebi_id": cid, "reason": (type(result).__name__ if isinstance(result, Exception)
+                                       else result.get("_error")),
+         "status": None if isinstance(result, Exception) else result.get("_status")}
+        for cid, result in zip(query_ids, search_results)
+        if isinstance(result, Exception) or _is_error(result)
+    ]
 
     boundary_analysis: list[dict[str, Any]] = []
-    # 反応 -> {side: [{chebi, component}]}。Rhea反応は双方向なので左右(side)は保持しつつ
-    # ブリッジ判定は方向非依存（対辺に別成分の境界代謝物があれば連結できる）とする。
+    # 反応 -> {side: [{chebi, component}]}。候補探索は左右を保持した構造的・方向非依存の探索。
     reaction_hits: dict[str, dict[str, Any]] = {}
 
     def _side_of(cid: str, rxn: dict) -> Optional[str]:
@@ -1572,8 +1952,9 @@ async def propose_gap_node_candidates(
             side = _side_of(cid, rxn)
             if side is None:
                 continue
-            cands.append({"rhea_id": rid, "equation": rxn["equation"]})
-            hit = reaction_hits.setdefault(rid, {"equation": rxn["equation"], "left": [], "right": []})
+            cands.append({"rhea_id": rid, "equation": rxn["equation"], "direction": rxn.get("direction")})
+            hit = reaction_hits.setdefault(rid, {"equation": rxn["equation"],
+                                                  "direction": rxn.get("direction"), "left": [], "right": []})
             hit[side].append({"chebi": cid, "component": comp})
             if len(cands) >= max_candidates_per_boundary:
                 break
@@ -1614,20 +1995,24 @@ async def propose_gap_node_candidates(
             seen_pairs.add(key)
             bridge_candidates.append({
                 "candidate_reaction": {"rhea_id": rid, "equation": reaction_eq.get(rid),
+                                       "direction": reaction_hits[rid].get("direction"),
                                        "url": f"https://www.rhea-db.org/rhea/{_rhea_num(rid)}"},
                 "candidate_enzymes": enzyme_map.get(rid, []),
                 "connects_components": [left["component"], right["component"]],
                 "rationale": (
                     f"成分{left['component']}の境界代謝物『{nodes[left['chebi']]['label']}』と"
                     f"成分{right['component']}の境界代謝物『{nodes[right['chebi']]['label']}』を相互変換する既知反応。"
-                    f"両成分を直接つなぐ中間ノードの候補（Rhea反応は双方向）。"
+                    f"両成分を直接つなぎうる中間ノード候補。方向性と細胞条件は別途検証が必要。"
                 ),
             })
 
     num_components = len(gaps["components"])
+    incomplete = not graph["_meta"]["complete"] or bool(boundary_search_failures)
     return _ok({
         "accessions": graph["_meta"]["accessions"],
-        "gap_present": num_components > 1,
+        "gap_present": None if incomplete else num_components > 1,
+        "candidate_search_status": "partial" if incomplete else "complete",
+        "boundary_search_failures": boundary_search_failures,
         "num_components": num_components,
         "bridge_candidates": bridge_candidates,
         "boundary_analysis": boundary_analysis,
@@ -1635,7 +2020,8 @@ async def propose_gap_node_candidates(
         "disclaimer": (
             "これらは既知反応データベース(Rhea)に基づく候補・仮説であり、gapの実在性や候補ノードの"
             "妥当性を断定するものではありません。新規タンパク質配列の生成は行っていません。"
-            "候補は必ず実験・文献で検証してください。"
+            "候補は代謝的実行可能性を保証せず、必ず実験・文献で検証してください。"
+            + (" 入力データまたは候補検索が不完全なため、候補の欠落や見かけ上のgapがあり得ます。" if incomplete else "")
         ),
         "hint": "bridge_candidates が2成分を直接つなぐ最有力の候補（candidate_enzymesに触媒酵素も併記）。"
                 "boundary_analysis は各境界からの拡張候補です。",

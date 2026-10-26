@@ -1,15 +1,28 @@
 [project]
 name = "pypromethica"
 version = "0.1.0"
-description = "Add your description here"
+description = "A lightweight MCP server for traceable life-science database retrieval and reaction-network analysis"
 readme = "README.md"
-requires-python = "==3.13.*"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "0xshooka" }]
+keywords = ["mcp", "bioinformatics", "gene-ontology", "gocam", "rhea", "uniprot"]
 dependencies = [
-    "aiohttp>=3.12.13",
     "cachetools>=6.1.0",
-    "fastapi>=0.115.13",
     "httpx>=0.28.1",
     "mcp[cli]>=1.9.4",
-    "pydantic>=2.11.7",
-    "uvicorn>=0.34.3",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.urls]
+Repository = "https://github.com/0xshooka/promethica"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["promethica"]
