@@ -26,6 +26,36 @@ def _json_success(payload: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+async def _gap_candidate_regression() -> str:
+    """方向未定義の解糖系反応から、欠落したPGAM反応・酵素を実APIで検出できるか確認する。"""
+    payload = await p.propose_gap_node_candidates(
+        ["P04406", "P00558", "P06733", "P14618"],
+        max_reactions=20,
+        max_boundary_metabolites=20,
+        max_candidates_per_boundary=8,
+    )
+    try:
+        result = json.loads(payload)
+    except json.JSONDecodeError:
+        return payload
+    bridge_ids = {
+        item.get("candidate_reaction", {}).get("rhea_id")
+        for item in result.get("bridge_candidates", [])
+    }
+    enzyme_ids = {
+        enzyme.get("accession")
+        for item in result.get("bridge_candidates", [])
+        for enzyme in item.get("candidate_enzymes", [])
+    }
+    if "RHEA:15901" not in bridge_ids or "P18669" not in enzyme_ids:
+        return json.dumps({
+            "error": "gap regression: expected RHEA:15901 and P18669",
+            "bridge_ids": sorted(rid for rid in bridge_ids if rid),
+            "enzyme_ids": sorted(acc for acc in enzyme_ids if acc),
+        })
+    return payload
+
+
 async def main() -> int:
     checks: list[Check] = [
         ("UniProt search", lambda: p.search_proteins("GAPDH", "Homo sapiens", 1)),
@@ -53,10 +83,7 @@ async def main() -> int:
         ("Reaction network", lambda: p.build_reaction_network(["P04406"], max_reactions=2)),
         ("Network gaps", lambda: p.detect_network_gaps(["P04406"], max_reactions=2)),
         ("Cytoscape export", lambda: p.export_network_cytoscape(["P04406"], max_reactions=2)),
-        ("Gap candidates", lambda: p.propose_gap_node_candidates(
-            ["P04406"], max_reactions=2, max_boundary_metabolites=1,
-            max_candidates_per_boundary=1
-        )),
+        ("Gap candidates", _gap_candidate_regression),
     ]
 
     failures: list[str] = []

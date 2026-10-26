@@ -817,19 +817,56 @@ def _parse_rhea_participants(html_text: str) -> tuple[list[tuple[str, str]], lis
 
     反応式は ' = ' で基質と生成物に分かれ、各参加物質は data-molid="chebi:N" を持つ。
     """
+    if not html_text or not html_text.strip():
+        raise ValueError("Rhea htmlequation is empty")
+
+    expected_participants = len(re.findall(r"\bdata-molid\s*=", html_text, re.IGNORECASE))
     parts = re.split(
         r"</span>\s*(?:&lt;=&gt;|&lt;=|=&gt;|<=>|<=|=>|=)\s*<span(?:\s[^>]*)?>",
         html_text,
         maxsplit=1,
     )
     if len(parts) != 2:
-        return [], []
+        raise ValueError("Rhea htmlequation could not be split into two sides")
     parsed: list[list[tuple[str, str]]] = []
     for part in parts:
         parser = _RheaEquationParser()
         parser.feed(part)
+        parser.close()
         parsed.append(parser.participants)
+    parsed_count = len(parsed[0]) + len(parsed[1])
+    if expected_participants == 0:
+        raise ValueError("Rhea htmlequation contains no participants")
+    if parsed_count != expected_participants:
+        raise ValueError(
+            f"Rhea participant count mismatch: expected {expected_participants}, parsed {parsed_count}"
+        )
+    if not parsed[0] or not parsed[1]:
+        raise ValueError("Rhea htmlequation has an empty reaction side")
     return parsed[0], parsed[1]
+
+
+def _parse_rhea_result(r: dict[str, Any]) -> dict[str, Any]:
+    """Rhea APIの1結果を検証・構造化する。解析不能な式は明示的なparse_errorにする。"""
+    rhea_id = f"RHEA:{r.get('id')}"
+    try:
+        left, right = _parse_rhea_participants(r.get("htmlequation", ""))
+    except ValueError as exc:
+        return {
+            "_error": f"Rhea反応 {rhea_id} の反応式を解析できませんでした",
+            "_error_type": "parse_error",
+            "_status": None,
+            "rhea_id": rhea_id,
+            "detail": str(exc),
+        }
+    equation = r.get("equation")
+    return {
+        "rhea_id": rhea_id,
+        "equation": equation,
+        "direction": _rhea_direction(equation or ""),
+        "left": left,
+        "right": right,
+    }
 
 
 async def _fetch_rhea_reaction(rhea_id: str) -> dict[str, Any]:
@@ -841,10 +878,7 @@ async def _fetch_rhea_reaction(rhea_id: str) -> dict[str, Any]:
     results = res.get("results") if isinstance(res, dict) else None
     if not results:
         return {"_error": f"Rhea反応 {rhea_id} が見つかりませんでした", "_status": None}
-    r = results[0]
-    left, right = _parse_rhea_participants(r.get("htmlequation", ""))
-    return {"rhea_id": f"RHEA:{r.get('id')}", "equation": r.get("equation"),
-            "direction": _rhea_direction(r.get("equation") or ""), "left": left, "right": right}
+    return _parse_rhea_result(results[0])
 
 
 async def _uniprot_catalytic_reactions(accession: str) -> dict[str, Any]:
@@ -880,12 +914,15 @@ async def _rhea_reactions_by_chebi(chebi_id: str, limit: int) -> dict[str, Any]:
     if _is_error(res):
         return res
     out = []
+    parse_failures = []
     for r in (res.get("results") or []):
-        left, right = _parse_rhea_participants(r.get("htmlequation", ""))
-        out.append({"rhea_id": f"RHEA:{r.get('id')}", "equation": r.get("equation"),
-                    "direction": _rhea_direction(r.get("equation") or ""),
-                    "left": left, "right": right})
-    return {"reactions": out}
+        parsed = _parse_rhea_result(r)
+        if _is_error(parsed):
+            parse_failures.append(parsed)
+        else:
+            out.append(parsed)
+    return {"reactions": out, "_meta": {"complete": not parse_failures,
+                                           "parse_failures": parse_failures}}
 
 
 async def _uniprot_enzymes_for_rhea(rhea_id: str, organism: str, size: int) -> list[dict[str, Any]]:
@@ -929,13 +966,18 @@ async def search_reactions(query: str, limit: int = 10) -> str:
     if _is_error(res):
         return _err("Rhea反応の検索に失敗しました", **res)
     reactions = []
+    parse_failures = []
     for r in (res.get("results") or []):
-        left, right = _parse_rhea_participants(r.get("htmlequation", ""))
+        parsed = _parse_rhea_result(r)
+        if _is_error(parsed):
+            parse_failures.append(parsed)
+            continue
         reactions.append({
-            "rhea_id": f"RHEA:{r.get('id')}",
-            "equation": r.get("equation"),
-            "substrates": [{"chebi": c, "name": n} for c, n in left],
-            "products": [{"chebi": c, "name": n} for c, n in right],
+            "rhea_id": parsed["rhea_id"],
+            "equation": parsed["equation"],
+            "direction": parsed["direction"],
+            "substrates": [{"chebi": c, "name": n} for c, n in parsed["left"]],
+            "products": [{"chebi": c, "name": n} for c, n in parsed["right"]],
             "url": f"https://www.rhea-db.org/rhea/{r.get('id')}",
         })
     return _ok({
@@ -943,6 +985,9 @@ async def search_reactions(query: str, limit: int = 10) -> str:
         "count": res.get("count", len(reactions)),
         "returned": len(reactions),
         "reactions": reactions,
+        "_meta": {"complete": not parse_failures,
+                  "completeness": "complete" if not parse_failures else "partial",
+                  "parse_failures": parse_failures},
         "source": "Rhea (CC-BY 4.0)",
     })
 
@@ -1594,6 +1639,8 @@ async def _build_reaction_network_data(
             continue
         if _is_error(detail):
             reaction_fetch_failures.append({"rhea_id": rid, "reason": detail.get("_error"),
+                                             "error_type": detail.get("_error_type"),
+                                             "detail": detail.get("detail"),
                                              "status": detail.get("_status")})
             continue
         meta = rhea_meta.get(rid, {})
@@ -1631,9 +1678,17 @@ async def _build_reaction_network_data(
                           "direction": direction})
 
     if not processed and reaction_fetch_failures:
+        failure_meta = {
+            "accessions": accs,
+            "reaction_fetch_failures": reaction_fetch_failures,
+            "complete": False,
+            "completeness": "partial",
+            "incomplete_reasons": ["rhea_fetch_failures"],
+            "analysis_possible": False,
+        }
         return {"_error": "必要なRhea反応データを取得できず、反応ネットワークを検出不能です",
                 "_status": None, "accessions": accs, "reaction_fetch_failures": reaction_fetch_failures,
-                "analysis_possible": False}
+                "analysis_possible": False, "_meta": failure_meta}
 
     incomplete_reasons = []
     if enzyme_fetch_failures:
@@ -1662,13 +1717,13 @@ async def _build_reaction_network_data(
             "completeness": "complete" if not incomplete_reasons else "partial",
             "incomplete_reasons": incomplete_reasons,
             "analysis_possible": bool(processed),
-            "direction_note": "Rhea '=' is direction-undefined; left/right are not substrate/product. Boundary analysis excludes undefined-direction reactions.",
+            "direction_note": "Rhea '=' is direction-undefined; left/right are not substrate/product. Directional boundaries exclude these reactions; structural boundaries remain available for direction-neutral candidate search.",
         },
     }
 
 
 def _compute_network_gaps(graph: dict[str, Any]) -> dict[str, Any]:
-    """グラフデータから弱連結成分・境界代謝物を算出する（detect/proposeで共用）。"""
+    """グラフデータから弱連結成分・方向付き/構造的境界を算出する。"""
     nodes = graph["nodes"]
     edges = graph["edges"]
 
@@ -1697,11 +1752,27 @@ def _compute_network_gaps(graph: dict[str, Any]) -> dict[str, Any]:
         if nodes[n]["type"] == "metabolite" and n in produced and n not in consumed
     ]
 
+    # 方向未定義反応ではinput/outputを主張できないため、次数1の代謝物を
+    # 「構造的境界」として別枠で扱う。これは方向性を意味せず、候補探索の起点にのみ使う。
+    participant_degree: dict[str, int] = {}
+    for edge in edges:
+        if edge["role"] != "participant":
+            continue
+        for endpoint in (edge["source"], edge["target"]):
+            if nodes.get(endpoint, {}).get("type") == "metabolite":
+                participant_degree[endpoint] = participant_degree.get(endpoint, 0) + 1
+    structural_boundaries = [
+        n for n in nodes
+        if nodes[n]["type"] == "metabolite" and participant_degree.get(n) == 1
+        and n not in consumed and n not in produced
+    ]
+
     return {
         "components": components,
         "comp_index": comp_index,
         "boundary_inputs": boundary_inputs,
         "boundary_outputs": boundary_outputs,
+        "structural_boundaries": structural_boundaries,
     }
 
 
@@ -1799,6 +1870,10 @@ async def detect_network_gaps(
 
     boundary_inputs = [{"id": n, "label": nodes[n]["label"]} for n in gaps["boundary_inputs"]]
     boundary_outputs = [{"id": n, "label": nodes[n]["label"]} for n in gaps["boundary_outputs"]]
+    structural_boundaries = [
+        {"id": n, "label": nodes[n]["label"], "role": "structural_boundary"}
+        for n in gaps["structural_boundaries"]
+    ]
 
     num_components = len(components)
     complete = graph["_meta"]["complete"]
@@ -1823,12 +1898,15 @@ async def detect_network_gaps(
         "boundary_outputs": boundary_outputs[:20],
         "boundary_inputs_count": len(boundary_inputs),
         "boundary_outputs_count": len(boundary_outputs),
+        "structural_boundaries": structural_boundaries[:20],
+        "structural_boundaries_count": len(structural_boundaries),
         "gap_detection_status": "complete" if complete else "indeterminate_incomplete_data",
         "gap_present": (num_components > 1) if complete else None,
         "interpretation": interpretation,
         "_meta": graph["_meta"],
-        "note": "境界代謝物は外部供給される基質/末端生成物。分断が反応数上限や通貨代謝物除外による"
-                "見かけ上のものでないか _meta を確認してください。",
+        "note": "方向付き境界は外部供給される基質/末端生成物。structural_boundariesは方向未定義反応に"
+                "1本だけ接続する探索用候補であり、基質/生成物を意味しません。分断が反応数上限や"
+                "通貨代謝物除外による見かけ上のものでないか _meta を確認してください。",
     })
 
 
@@ -1886,7 +1964,7 @@ async def propose_gap_node_candidates(
         accessions: UniProtアクセッションのリスト
         max_reactions: グラフ構築時に処理する反応の最大数（デフォルト:40）
         exclude_currency: 通貨代謝物を除外するか（デフォルト:True。ブリッジ品質のため推奨）
-        max_boundary_metabolites: 候補探索する境界代謝物の上限（入力/出力それぞれ、デフォルト:12）
+        max_boundary_metabolites: 候補探索する境界代謝物の上限（入力/出力/構造的境界それぞれ、デフォルト:12）
         max_candidates_per_boundary: 境界代謝物1つあたりの候補反応の上限（デフォルト:8）
         organism: 候補酵素の逆引き対象生物種（デフォルト: Homo sapiens。空文字で全生物種）
     """
@@ -1908,9 +1986,13 @@ async def propose_gap_node_candidates(
 
     b_outputs = gaps["boundary_outputs"][:max_boundary_metabolites]
     b_inputs = gaps["boundary_inputs"][:max_boundary_metabolites]
+    directional_ids = set(b_outputs + b_inputs)
+    b_structural = [cid for cid in gaps["structural_boundaries"] if cid not in directional_ids][
+        :max_boundary_metabolites
+    ]
 
     # 境界代謝物を含むRhea反応を並列検索
-    query_ids = b_outputs + b_inputs
+    query_ids = b_outputs + b_inputs + b_structural
     search_results = await asyncio.gather(
         *[_rhea_reactions_by_chebi(cid, max_candidates_per_boundary * 3) for cid in query_ids],
         return_exceptions=True,
@@ -1926,6 +2008,18 @@ async def propose_gap_node_candidates(
         for cid, result in zip(query_ids, search_results)
         if isinstance(result, Exception) or _is_error(result)
     ]
+    for cid, result in zip(query_ids, search_results):
+        if isinstance(result, Exception) or _is_error(result):
+            continue
+        for failure in result.get("_meta", {}).get("parse_failures", []):
+            boundary_search_failures.append({
+                "chebi_id": cid,
+                "rhea_id": failure.get("rhea_id"),
+                "reason": failure.get("_error"),
+                "error_type": failure.get("_error_type"),
+                "detail": failure.get("detail"),
+                "status": failure.get("_status"),
+            })
 
     boundary_analysis: list[dict[str, Any]] = []
     # 反応 -> {side: [{chebi, component}]}。候補探索は左右を保持した構造的・方向非依存の探索。
@@ -1939,7 +2033,8 @@ async def propose_gap_node_candidates(
         return None
 
     boundary_meta = [(cid, "boundary_output") for cid in b_outputs] + \
-                    [(cid, "boundary_input") for cid in b_inputs]
+                    [(cid, "boundary_input") for cid in b_inputs] + \
+                    [(cid, "structural_boundary") for cid in b_structural]
 
     for cid, role in boundary_meta:
         res = result_map.get(cid)
@@ -1962,7 +2057,11 @@ async def propose_gap_node_candidates(
             "metabolite": {"id": cid, "label": nodes[cid]["label"]},
             "role": role,
             "component": comp,
-            "direction": ("この代謝物が関与する他の既知反応（下流/上流に置きうる候補ノード）"),
+            "direction": (
+                "方向を仮定せず、この代謝物が関与する他の既知反応を探索"
+                if role == "structural_boundary" else
+                "この代謝物が関与する他の既知反応（下流/上流に置きうる候補ノード）"
+            ),
             "candidate_reactions": cands,
         })
 

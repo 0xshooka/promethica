@@ -73,7 +73,7 @@ Local PDB access is restricted to `PROMETHICA_ALLOWED_PDB_DIRS`, a platform path
 - `export_network_cytoscape(accessions, max_reactions, exclude_currency)`
 - `propose_gap_node_candidates(accessions, ...)`
 
-Rhea's left and right sides are not automatically substrates and products. Promethica preserves Rhea direction (`left_to_right`, `right_to_left`, `bidirectional`, or `undefined`) and keeps non-ChEBI `RHEA-COMP` participants in graph connectivity without mislabeling them as boundary metabolites. Undefined-direction reactions contribute to weak connectivity but not input/output boundary claims. Candidate bridges are structural hypotheses, not proof of a metabolically feasible pathway.
+Rhea's left and right sides are not automatically substrates and products. Promethica preserves Rhea direction (`left_to_right`, `right_to_left`, `bidirectional`, or `undefined`) and keeps non-ChEBI `RHEA-COMP` participants in graph connectivity without mislabeling them as boundary metabolites. Undefined-direction reactions contribute to weak connectivity but not input/output boundary claims. Degree-one metabolites on those reactions are reported separately as `structural_boundaries` and can seed direction-neutral candidate searches. Candidate bridges are structural hypotheses, not proof of a metabolically feasible pathway. Malformed or incomplete Rhea equations are reported as `parse_error` failures instead of being accepted as disconnected reactions.
 
 Network responses include completeness metadata: failed UniProt/Rhea fetches, accessions with no reaction annotation, reaction IDs skipped by `max_reactions`, and whether analysis is complete. Gap presence is reported as indeterminate when required data is incomplete.
 

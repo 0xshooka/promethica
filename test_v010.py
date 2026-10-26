@@ -99,6 +99,75 @@ async def test_rhea_parser_chebi_normalization_and_multiple_participants():
         p._chebi_norm("CHEBI:nope")
 
 
+@pytest.mark.parametrize("equation", [
+    '<span><a data-molid="chebi:1">A</a></span>',
+    '<span><a data-molid="chebi:1">A</a></span> = <span>missing id</span>',
+    '<span><a data-molid="chebi:1">A</span> = <span><a data-molid="chebi:2">B</a></span>',
+])
+async def test_rhea_parser_rejects_unsplittable_empty_or_partial_results(equation):
+    with pytest.raises(ValueError):
+        p._parse_rhea_participants(equation)
+
+
+async def test_rhea_parse_failure_is_explicit_and_marks_network_partial(monkeypatch):
+    malformed = {
+        "results": [{
+            "id": 123,
+            "equation": "A = B",
+            "htmlequation": '<span><a data-molid="chebi:1">A</a></span>',
+        }]
+    }
+    monkeypatch.setattr(p, "make_api_request", AsyncMock(return_value=malformed))
+    parsed = await p._fetch_rhea_reaction("RHEA:123")
+    assert parsed["_error_type"] == "parse_error"
+    assert parsed["rhea_id"] == "RHEA:123"
+
+    monkeypatch.setattr(p, "_uniprot_catalytic_reactions", AsyncMock(return_value={
+        "reactions": [{"rhea_id": "RHEA:123", "name": "bad", "ec": None}]
+    }))
+    graph = await p._build_reaction_network_data(["P1"], 10, True)
+    assert graph["analysis_possible"] is False
+    assert graph["reaction_fetch_failures"][0]["error_type"] == "parse_error"
+    assert graph["_meta"]["completeness"] == "partial"
+    assert graph["_meta"]["reaction_fetch_failures"][0]["error_type"] == "parse_error"
+
+
+async def test_rhea_parse_failure_propagates_to_partial_network_metadata(monkeypatch):
+    async def catalytic(_acc):
+        return {"reactions": [
+            {"rhea_id": "RHEA:1", "name": "good", "ec": None},
+            {"rhea_id": "RHEA:2", "name": "bad", "ec": None},
+        ]}
+
+    async def reaction(rid):
+        if rid == "RHEA:2":
+            return {"_error": "parse failed", "_error_type": "parse_error", "_status": None,
+                    "detail": "could not split"}
+        return {"equation": "a = b", "direction": "undefined",
+                "left": [("CHEBI:10", "a")], "right": [("CHEBI:20", "b")]}
+
+    monkeypatch.setattr(p, "_uniprot_catalytic_reactions", catalytic)
+    monkeypatch.setattr(p, "_fetch_rhea_reaction", reaction)
+    graph = await p._build_reaction_network_data(["P1"], 10, True)
+    assert graph["_meta"]["completeness"] == "partial"
+    assert graph["_meta"]["incomplete_reasons"] == ["rhea_fetch_failures"]
+    assert graph["_meta"]["reaction_fetch_failures"][0]["error_type"] == "parse_error"
+
+
+async def test_rhea_search_reports_partial_parse_failures(monkeypatch):
+    response = {"count": 2, "results": [
+        {"id": 1, "equation": "A = B", "htmlequation":
+         '<span><a data-molid="chebi:1">A</a></span> = '
+         '<span><a data-molid="chebi:2">B</a></span>'},
+        {"id": 2, "equation": "C = D", "htmlequation": "not parseable"},
+    ]}
+    monkeypatch.setattr(p, "make_api_request", AsyncMock(return_value=response))
+    result = json.loads(await p.search_reactions("test"))
+    assert result["returned"] == 1
+    assert result["_meta"]["completeness"] == "partial"
+    assert result["_meta"]["parse_failures"][0]["_error_type"] == "parse_error"
+
+
 async def test_currency_exclusion_and_weak_components(monkeypatch):
     async def catalytic(acc):
         return {"reactions": [{"rhea_id": f"RHEA:{1 if acc == 'A' else 2}", "name": acc, "ec": None}]}
@@ -117,6 +186,43 @@ async def test_currency_exclusion_and_weak_components(monkeypatch):
     assert len(gaps["components"]) == 2
     assert "CHEBI:30" in gaps["boundary_inputs"] and "CHEBI:40" in gaps["boundary_outputs"]
     assert "CHEBI:10" not in gaps["boundary_inputs"]
+
+
+async def test_undefined_reactions_use_structural_boundaries_for_bridge_candidates(monkeypatch):
+    async def catalytic(acc):
+        rid = "RHEA:1" if acc == "A" else "RHEA:2"
+        return {"reactions": [{"rhea_id": rid, "name": acc, "ec": None}]}
+
+    async def reaction(rid):
+        sides = {
+            "RHEA:1": ([('CHEBI:10', 'a')], [('CHEBI:11', 'b')]),
+            "RHEA:2": ([('CHEBI:20', 'c')], [('CHEBI:21', 'd')]),
+        }
+        left, right = sides[rid]
+        return {"equation": "x = y", "direction": "undefined", "left": left, "right": right}
+
+    async def search(_cid, _limit):
+        return {"reactions": [{
+            "rhea_id": "RHEA:99", "equation": "b = c", "direction": "undefined",
+            "left": [("CHEBI:11", "b")], "right": [("CHEBI:20", "c")],
+        }], "_meta": {"complete": True, "parse_failures": []}}
+
+    monkeypatch.setattr(p, "_uniprot_catalytic_reactions", catalytic)
+    monkeypatch.setattr(p, "_fetch_rhea_reaction", reaction)
+    monkeypatch.setattr(p, "_rhea_reactions_by_chebi", search)
+    monkeypatch.setattr(p, "_uniprot_enzymes_for_rhea", AsyncMock(return_value=[{"accession": "P99"}]))
+
+    graph = await p._build_reaction_network_data(["A", "B"], 10, True)
+    gaps = p._compute_network_gaps(graph)
+    assert gaps["boundary_inputs"] == [] and gaps["boundary_outputs"] == []
+    assert set(gaps["structural_boundaries"]) == {"CHEBI:10", "CHEBI:11", "CHEBI:20", "CHEBI:21"}
+
+    result = json.loads(await p.propose_gap_node_candidates(
+        ["A", "B"], max_boundary_metabolites=10, max_candidates_per_boundary=3
+    ))
+    assert {item["role"] for item in result["boundary_analysis"]} == {"structural_boundary"}
+    assert result["bridge_candidates"][0]["candidate_reaction"]["rhea_id"] == "RHEA:99"
+    assert result["bridge_candidates"][0]["candidate_enzymes"][0]["accession"] == "P99"
 
 
 async def test_partial_api_failure_marks_gap_indeterminate(monkeypatch):
